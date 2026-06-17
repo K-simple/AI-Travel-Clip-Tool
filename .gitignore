@@ -1,0 +1,27 @@
+# Node
+node_modules/
+frontend/.next/
+frontend/out/
+
+# Python
+__pycache__/
+*.py[cod]
+*.sqlite
+backend/venv/
+
+# Environment
+.env
+.env.local
+frontend/.env.local
+backend/.env
+
+# Storage & database
+backend/storage/
+backend/ai_travel_cut.db
+backend/ai_travel_cut.db-*
+
+# Misc
+.DS_Store
+*.log
+.cursor/
+terminals/
