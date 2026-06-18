@@ -1,6 +1,8 @@
-# ai-travel-cut
+# AI-Travel-Clip-Tool
 
-模板驱动的 AI 旅游混剪工具 —— 用一条「模板成片」定义节奏与字幕，用户按槽位上传旅途素材，系统自动匹配并导出竖屏短视频。
+> 模板驱动的 AI 旅游混剪工具 —— 用一条「模板成片」定义节奏与字幕，用户按槽位上传旅途素材，系统自动匹配并导出竖屏短视频，也可导出剪映草稿继续精修。
+
+**GitHub：** [K-simple/AI-Travel-Clip-Tool](https://github.com/K-simple/AI-Travel-Clip-Tool)
 
 ## 项目在做什么
 
@@ -14,7 +16,7 @@
 2. 创建项目，时间轴展示模板各段的时长、缩略图与默认字幕。
 3. 上传用户旅途素材，拖入视频轨槽位，或一键 **AI 自动匹配**（CLIP 标签 + 景别 + 画质 + 时长加权）。
 4. 在属性面板微调入点、字幕、锁定等；预览区查看当前播放头所在槽位的素材。
-5. 保存项目，导出成片：画面来自用户素材拼接，音频/字幕默认来自模板。
+5. 保存项目，导出成片 MP4，或 **导出剪映草稿**（CapCut Mate）在剪映 PC 中继续编辑 / 逐段替换素材。
 
 ### 核心工作流（端到端）
 
@@ -29,7 +31,7 @@
     ↓
 编辑字幕、入点、轨道预览控制
     ↓
-保存 timeline → ffmpeg 合成导出 MP4
+保存 timeline → ffmpeg 合成导出 MP4 / CapCut Mate 导出剪映草稿
 ```
 
 ### 技术架构
@@ -37,18 +39,21 @@
 | 层级 | 技术 | 职责 |
 |------|------|------|
 | 前端 | Next.js 14 + React + Tailwind | 编辑器 UI、时间轴、预览、API 调用 |
-| 后端 | FastAPI + SQLite | REST API、任务编排、文件存储 |
+| 后端 | FastAPI + SQLite | REST API、内存任务队列、文件存储 |
 | 视频 | ffmpeg / ffprobe | 抽帧、裁切、拼接、混音、烧录字幕 |
 | 镜头 | PySceneDetect | 模板与素材场景切分 |
-| 视觉 | OpenCLIP ViT-B/32 | 素材片段标签、景别、画质 |
+| 视觉 | OpenCLIP ViT-B/32 + DeepSeek V4 | 素材/槽位标签、景别、中文画面描述 |
 | 语音 | faster-whisper | 模板/槽位字幕识别 |
+| 剪映 | CapCut Mate API | 导出剪映 PC 草稿（成片 / 可替换模板） |
 | 存储 | `backend/storage/` | 模板、素材、缩略图、导出、临时文件 |
 
 ### 能力边界（当前版本）
 
-**已具备：** 模板驱动混剪 MVP、剪映风格四轨 UI、槽位级编辑与 AI 匹配、轨道锁定/隐藏/静音/独奏（预览侧）、项目持久化、1080×1920 导出。
+**已具备：** 模板驱动混剪 MVP、剪映风格四轨 UI、槽位级编辑与 AI 匹配、DeepSeek 中文标签、轨道锁定/隐藏/静音/独奏、项目持久化、异步 MP4 导出、**剪映草稿导出**（含可替换模板模式）、素材快速入库、预览双缓冲切镜、CapCut 状态检测与一键打开草稿。
 
-**尚未具备：** 自由多轨剪辑、时间轴裁切拖拽、真实波形、转场特效、封面设置、模板 BGM 预览、导出遵循轨道静音/隐藏、批量槽位字幕识别、异步导出进度等（详见下方「待完善功能」）。
+**部分具备 / 持续迭代：** 真·多轨自由剪辑（槽位 + EDL 叠层）、转场/调色实时预览（FFmpeg 滤镜链）、抖音 OAuth 直推（需配置）、剪映官方「创作模板」一键全槽替换（CapCut Mate 不支持，见下方说明）。
+
+**尚未具备：** 云渲染、断点续传上传、完整剪映快捷键集、PostgreSQL/Redis 生产部署等（详见下方 PRD 对照）。
 
 ## 项目概览
 
@@ -68,7 +73,7 @@
 | 素材 | `/api/assets` | `POST /upload`、`GET /list`、`GET /{id}/status`、`GET /tasks/{task_id}`、`POST /{id}/reprocess`、`DELETE /{id}` | 旅途素材上传、CLIP 分析、分段切片、进度轮询与删除 |
 | 匹配 | `/api/match` | `POST /run`、`PUT /replace` | AI 自动匹配槽位、手动替换槽位素材 |
 | 字幕 | `/api/subtitle` | `POST /recognize`、`POST /recognize-slot` | 整文件语音识别、按槽位时间范围识别字幕 |
-| 导出 | `/api/export` | `POST /render`、`POST /render-async`、`GET /tasks/{task_id}`、`GET /codecs` | 同步/异步导出成片、编码器探测 |
+| 导出 | `/api/export` | `POST /render`、`POST /render-async`、`POST /capcut-draft`、`GET /capcut-status`、`GET /tasks/{task_id}`、`GET /codecs` | 同步/异步导出 MP4、剪映草稿导出、CapCut Mate 连通性检测 |
 | 项目 | `/api/projects` | `POST /create`、`POST /from-template`、`POST /{id}/refresh-from-template`、`GET /list`、`GET /{id}`、`PUT /{id}/timeline` | 项目 CRUD、从模板初始化、保存时间轴 |
 | 任务 | `/api/tasks` | `GET /{task_id}` | 通用后台任务状态查询 |
 | 认证 | `/api/auth` | `GET /status`、`POST /register`、`POST /login` | 用户注册登录（可选，MVP 占位） |
@@ -111,7 +116,7 @@
 | `subtitle.py` | 整轨 Whisper 识别生成 SRT；按槽位时间从模板音频切片识别 |
 | `export.py` | 校验未匹配槽位后调用 `video_exporter` 合成；支持异步导出任务与编码器列表 |
 | `project.py` | 创建空项目、从模板初始化 timeline、保存/合并 timeline、刷新模板元数据、列表与加载 |
-| `tasks.py` | 统一查询内存/Celery 任务进度 |
+| `tasks.py` | 统一查询内存任务进度 |
 | `auth.py` | 简单用户注册/登录（可选扩展） |
 | `effects.py` | 返回 100+ 转场预设；根据槽位特效参数编译 FFmpeg 滤镜预览 |
 | `cloud.py` | 云素材 catalog 的列表、注册、导入到本地素材库 |
@@ -125,7 +130,13 @@
 | 文件 | 功能 |
 |------|------|
 | `template_processor.py` | 模板处理流水线：快速入库 → 场景精修 → 音频提取 → Whisper 字幕 → 槽位缩略图修复 |
-| `asset_processor.py` | 素材处理流水线：快速分段 → CLIP 分析 → 代理视频生成 → 多镜头 MP4 切片 |
+| `asset_processor.py` | 素材流水线：**先可用后增强**（快速入库 → 镜头精分 → 后台代理/AI 标签） |
+| `capcut_draft_exporter.py` | 裁剪槽位片段 → CapCut Mate 创建剪映草稿（成片 / 可替换模板） |
+| `capcut_mate_client.py` | 剪映小助手 REST 客户端（create_draft / add_videos / add_captions 等） |
+| `ai_label_enricher.py` | DeepSeek V4 中文画面描述与关键词标签 |
+| `ai_shot_refiner.py` | DeepSeek 辅助模板镜头边界修正 |
+| `deepseek_client.py` | DeepSeek API 封装（文本 + 视觉） |
+| `template_scene_tuning.py` | 旅游混剪镜头切分档位与 threshold 自动校准 |
 | `scene_detector.py` | PySceneDetect 场景切分、ffprobe 读时长、关键帧/间隔抽帧 |
 | `asset_analyzer.py` | OpenCLIP 画面标签、景别分类、画质 Laplacian 评分、片段 embedding |
 | `segment_extractor.py` | 将分析片段裁成独立 MP4，供时间轴胶片条与匹配使用 |
@@ -137,9 +148,8 @@
 | `audio_processor.py` | 模板音频流复制/转码、轻度滤波与限幅，降低噪点 |
 | `video_exporter.py` | FFmpeg 拼接用户素材、混音模板 BGM、烧录 ASS/SRT 字幕、输出 1080×1920 MP4 |
 | `proxy_generator.py` | 生成 720p 预览代理；探测 NVENC 硬件编码 |
-| `processing_config.py` | 环境变量开关：`FAST_MODE`、`SKIP_CLIP`、`SKIP_SEGMENT_MP4` 等性能调优 |
+| `processing_config.py` | 性能开关：`FAST_MODE`、`ASSET_FAST_EDIT_READY`、`DEFER_ASSET_PROXIES`、模板切分档位等 |
 | `task_queue.py` | 内存线程池异步任务：创建/更新/查询任务状态 |
-| `celery_app.py` | 可选 Celery+Redis 任务队列，无 Redis 时回退内存队列 |
 | `transitions.py` | 转场预设目录与 xfade 参数解析 |
 | `effects_engine.py` | 将关键帧、调色、蒙版、变速编译为 FFmpeg `filter_complex` |
 | `edl_exporter.py` | 从 EDL 多轨文档导出（叠层、转场、特效、字幕轨） |
@@ -155,8 +165,10 @@
 | `security.py` | 可选 `API_KEY` 鉴权中间件；上传大小/类型校验；`storage/` 路径白名单防注入 |
 | `timeline.py` | 保存项目时合并 timeline，保留模板侧 `slot_start`、`shot_type` 等元数据 |
 | `edl_timeline.py` | 槽位 timeline ↔ EDL 文档双向转换，补全资源路径 |
-| `upload_stream.py` | 异步流式保存大文件上传（跨盘符安全） |
+| `upload_stream.py` | 异步流式保存大文件上传（16MB 块） |
 | `storage_backend.py` | 本地存储路径解析、公开 URL 生成、字节写入 |
+| `public_media.py` | CapCut Mate 可访问的素材 URL 构建与连通性校验 |
+| `export_controls.py` | 导出混音/字幕/轨道静音等选项解析 |
 
 #### `backend/storage/` — 本地文件存储
 
@@ -196,8 +208,6 @@
 | `PreviewPanel.tsx` | 右侧预览：9:16 画幅、清晰度（原片/代理）、播放/暂停、逐帧步进、模板 BGM 混音、叠层预览、导出状态与下载 |
 | `PublishPanel.tsx` | 导出后面板：抖音 OAuth 授权、填写标题、一键发布 |
 | `Timeline.tsx` | 底部时间轴主容器：五轨布局、播放头拖拽、标尺点击、片段选中、拖放素材、缩放、磁吸、节拍标记、模板空轨提示 |
-| `TemplatePanel.tsx` | 旧版模板面板（已废弃，未接入路由） |
-
 #### `frontend/components/timeline/` — 时间轴子模块（剪映风格）
 
 | 文件 | 功能 |
@@ -223,8 +233,11 @@
 | `slotOps.ts` | 删除槽位、重排序、波纹删除右侧、裁切入点/时长 |
 | `slotEffects.ts` | 槽位特效结构与 timeline 字段互转 |
 | `edlModel.ts` | 叠层轨（V2 贴纸 / V3 画中画）数据模型、布局、拖放创建 |
-| `edlTimeline.ts` | EDL 文档类型、从 EDL 读取字幕轨与节拍标记 |
 | `matchStrategy.ts` | 前端匹配策略默认值与 API 请求体转换 |
+| `capcutExport.ts` | 剪映草稿导出、CapCut Mate 状态检测、打开 draft_url |
+| `exportPrecheck.ts` | 导出前校验（未匹配槽位、处理中素材等） |
+| `exportSettings.ts` | 导出请求体构建（轨道控制、字幕、混音） |
+| `previewPlayback.ts` | 预览双视频缓冲、预加载下一镜头、切镜淡入淡出 |
 | `previewSettings.ts` | 预览画幅比例预设、原片/代理源解析 |
 | `uploadAsset.ts` | 带进度回调的素材/模板 XHR 上传 |
 | `useTemplateProcessing.ts` | 轮询模板 `processing_status` 与进度，完成后触发 timeline 刷新 |
@@ -239,8 +252,110 @@ URL ?project_id= → 加载项目 timeline
 素材库上传     → assets API   → useAssetProcessing 轮询 → 刷新分段列表
 拖放/自动匹配  → match API    → 更新槽位 matchedAssetId / file_path
 属性面板编辑   → 本地 slots 状态 → PUT /projects/{id}/timeline 保存
-导出           → export API   → 下载 exports/ 下 MP4
+导出           → export API   → 下载 MP4 或打开剪映 draft_url
 ```
+
+---
+
+## 剪映草稿导出
+
+通过 [CapCut Mate（剪映小助手）](https://github.com/sun-guannan/CapCutMate) 将当前项目时间轴写入剪映 PC 草稿。
+
+### 前置条件
+
+1. 安装 **剪映 PC 版**
+2. 启动 **CapCut Mate**（默认 `http://localhost:30000`）
+3. 后端可访问：`CAPCUT_MATE_BASE_URL`；素材 URL 需 CapCut Mate 能拉取（见 `PUBLIC_MEDIA_BASE_URL`）
+
+### 两种导出模式
+
+| 模式 | 说明 |
+|------|------|
+| **成片模式**（默认） | 使用已匹配素材 + 模板 BGM/字幕/转场，导出可直接精修的成片草稿 |
+| **可替换模板** | 每槽位一段模板占位 + 黄色槽位标签，在剪映中选中片段 →「替换素材」逐段套用你的成片 |
+
+> CapCut Mate **不支持**剪映官方「创作模板 / 一键全槽替换」格式；可替换模式是结构化占位草稿的替代方案。
+
+### 相关 API
+
+- `GET /api/export/capcut-status` — 检测小助手是否就绪
+- `POST /api/export/capcut-draft` — 请求体含 `capcut_export_mode`: `filled` | `replaceable_template`
+
+---
+
+## 当前进度
+
+### 已完成（截至 2026-06-18）
+
+**核心闭环**
+
+- 模板上传 → 场景切分（旅游混剪档位 + 可选 DeepSeek 镜头修正）→ 槽位 timeline
+- 素材上传 → **快速入库**（数秒内可拖拽）→ 后台镜头精分 / 代理 / AI 标签
+- AI 匹配（CLIP + 标签 + 景别 + 时长加权）+ 手动拖放替换
+- MP4 导出（EDL 管线、异步任务、轨道静音/字幕开关）
+- **剪映草稿导出**（CapCut Mate、可替换模板、slot_manifest）
+- 项目 CRUD、自动保存、封面、模板库 `.ctpl`、云素材/市场占位 API
+
+**编辑器体验**
+
+- 剪映风格四轨时间轴、轨道锁定/隐藏/静音/独奏
+- 预览 **双视频缓冲** 预加载下一镜头，切镜更流畅；时间轴片段 **零间隙** 显示
+- 导出前校验、CapCut 状态提示、导出后自动打开 `draft_url`
+- DeepSeek V4 中文画面描述（模板槽位 + 素材片段）
+
+**工程化**
+
+- 死代码清理：移除 Celery/Redis 依赖、未用模块与前端冗余 import
+- Git 仓库：[K-simple/AI-Travel-Clip-Tool](https://github.com/K-simple/AI-Travel-Clip-Tool)
+- `.gitignore` 排除 `.env`、`storage/`、`node_modules/` 等
+
+### 性能开关（`backend/.env`）
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `FAST_PROCESSING` | `1` | 总开关，偏向快速就绪 |
+| `ASSET_FAST_EDIT_READY` | `1` | 素材先入库可拖拽，精分/代理/标签后台继续 |
+| `DEFER_ASSET_PROXIES` | `1` | 素材预览代理延后生成 |
+| `DEFER_ASSET_AI_LABELS` | `1` | DeepSeek 标签延后批量补充 |
+| `TEMPLATE_FAST_EDIT_READY` | `1` | 模板约 10 秒内可编辑 |
+| `CAPCUT_MATE_BASE_URL` | `http://localhost:30000` | 剪映小助手地址 |
+
+完整列表见 `backend/.env.example`。
+
+### 仍可继续迭代
+
+| 功能 | 现状 |
+|------|------|
+| 真·多轨自由剪辑 | 槽位驱动 + EDL 叠层（V2/V3） |
+| 剪映官方模板包 | CapCut Mate 无 API，仅可替换占位草稿 |
+| 批量/文件夹素材上传 | 单文件上传 |
+| 云渲染 / WebSocket 进度 | 内存任务队列 + HTTP 轮询 |
+| 抖音直推 | OAuth 需 `DOUYIN_CLIENT_*` 环境变量 |
+
+### 历史迭代记录（2026-06）
+
+**2026-06 已补齐：**
+
+| 功能 | 状态 |
+|------|------|
+| 导出遵循轨道静音/隐藏/独奏 | ✅ `export_controls` + 前端 `buildExportPayload` |
+| 导出烧录字幕开关 | ✅ 预览抽屉「导出时烧录字幕」 |
+| 模板槽位 CLIP / DeepSeek 标签 | ✅ 快速入库后后台 enrich |
+| 项目列表/删除/重命名 | ✅ `ProjectListModal` + `PATCH/DELETE /projects/{id}` |
+| 批量槽位字幕识别 | ✅ `POST /subtitle/recognize-slot-batch` |
+| 详细 match_reason | ✅ 标签/景别/时长分项展示 |
+| 云素材导入本地 | ✅ `POST /cloud/import/{id}` + UI |
+| 封面设置 | ✅ 轨道头点击上传 |
+| 导出进度条 | ✅ 异步轮询进度 |
+| 槽位拖拽排序 | ✅ 时间轴 ⋮⋮ 拖拽 |
+| 模板 BGM 波形 | ✅ `/api/template/{id}/waveform` |
+| `.ctpl` 模板库 UI | ✅ 侧栏「模板库」Tab |
+
+**已知限制：**
+
+- `recognize-slot` 结果不写回 DB，重复识别会重复跑 Whisper
+- Whisper 默认 `base` + CPU；超大文件导出无取消按钮
+- 需 CapCut Mate + 剪映 PC 才能使用剪映草稿导出
 
 ---
 
@@ -251,7 +366,7 @@ URL ?project_id= → 加载项目 timeline
 - `backend/main.py` - FastAPI 应用入口。
 - `backend/routers/` - HTTP 接口（见上方「路由层」表）。
 - `backend/services/` - 核心业务逻辑（见上方「服务层」表）。
-- `backend/utils/` - 安全、timeline 合并、EDL 转换、上传流。
+- `backend/utils/` - 安全、timeline 合并、EDL 转换、上传流、公开媒体 URL。
 - `backend/models/database.py` - ORM 与数据库会话。
 
 ### 前端
@@ -259,75 +374,15 @@ URL ?project_id= → 加载项目 timeline
 - `frontend/app/` - Next.js 页面（首页 + 编辑器）。
 - `frontend/components/` - UI 组件（见上方「UI 组件」表）。
 - `frontend/components/timeline/` - 时间轴子模块（见上方表）。
-- `frontend/lib/` - API、timeline、拖放、历史、上传等共享逻辑。
-
-## 当前进度
-
-### 已完成（MVP）
-
-**后端**
-
-- 模板上传：镜头切分、缩略图、后台提取音频 + Whisper 全轨字幕、槽位默认字幕挂载。
-- 素材上传：时长/缩略图、镜头切分、CLIP 片段分析（标签、景别、画质）。
-- 匹配：加权评分（标签 Jaccard、景别+画质、时长）、去重策略、槽位锁定、手动替换。
-- 字幕：整文件识别、按槽位时间范围识别（`slot_subtitle.py`）。
-- 导出：素材拼接 + 模板音频混音 + ASS/SRT 烧录，未匹配槽位校验。
-- 项目：创建、从模板初始化、timeline 合并保存、列表与加载。
-- 安全：可选 API Key、上传校验、存储路径白名单。
-
-**前端**
-
-- 编辑器单页：素材库 + 属性面板 + 9:16 预览 + 底部时间轴。
-- 剪映风格四轨导轨（视频/字幕/贴纸/音频）、工具栏、标尺、播放头、片段样式。
-- 轨道控制：锁定/隐藏/静音/独奏（预览与编辑限制已联动）。
-- 拖放：空轨导入模板；有槽位时拖入素材库或本地视频按落点分配。
-- 槽位编辑：入点、字幕、锁定、原声开关；播放头处分割；撤销/重做（40 步）。
-- 匹配权重滑块、AI 自动匹配、AI 槽位字幕识别、保存/载入/导出。
-- 生产构建可通过；`?project_id=` URL 自动加载项目。
-
-### 待完善功能
-
-**2026-06 已补齐（本轮）：**
-
-| 功能 | 状态 |
-|------|------|
-| 导出遵循轨道静音/隐藏/独奏 | ✅ `export_controls` + 前端 `buildExportPayload` |
-| 导出烧录字幕开关 | ✅ 预览抽屉「导出时烧录字幕」 |
-| 模板槽位 CLIP 分析 | ✅ `process_template_slot_enrich` 快速入库后自动跑 |
-| 项目列表/删除/重命名 | ✅ `ProjectListModal` + `PATCH/DELETE /projects/{id}` |
-| 批量槽位字幕识别 | ✅ `POST /subtitle/recognize-slot-batch` |
-| 详细 match_reason | ✅ 标签/景别/时长分项展示 |
-| 素材详情 `GET /assets/{id}` | ✅ |
-| 云素材导入本地 | ✅ `POST /cloud/import/{id}` + UI |
-| 封面设置 | ✅ 轨道头点击上传 |
-| 匹配去重策略 UI | ✅ `dedup_policy` 下拉 |
-| 导出进度条 | ✅ 异步轮询进度 |
-| 死代码清理 | ✅ 删除 `TemplatePanel`，移除无用 `onSlotDrop` |
-| 快捷键文案 | ✅ 分割 S、重做 Ctrl+Shift+Z |
-
-**仍可继续迭代：**
-
-| 功能 | 现状 |
-|------|------|
-| 真·多轨自由剪辑 | 仍为槽位驱动 + EDL 叠层 |
-| 真实音频波形 | ✅ 模板 BGM 轨已接 `/api/template/{id}/waveform`（需 ffmpeg） |
-| 槽位拖拽排序 | ✅ 时间轴 ⋮⋮ 拖拽 + 属性面板 ↑↓ |
-| 转场/调色实时预览 | ✅ FFmpeg 滤镜链预览 + 预览区 CSS 近似调色 |
-| 抖音直推 | OAuth 需配置环境变量 |
-| `.ctpl` 模板库 UI | ✅ 侧栏「模板库」Tab：列表 / 导入 / 导出 |
-
-
-- `template.py` 与 `video_exporter.py` 中 SRT/ASS 逻辑重复。
-- `recognize-slot` 结果不写回 DB，重复识别会重复跑 Whisper。
-- `subtitle.py` `/recognize` 临时 SRT 可能残留在 `storage/temp/`。
-- 无项目删除/重命名 API；模板处理中导出返回 409，前端无统一轮询 UX。
-- Whisper 固定 `base` + CPU；大文件导出无超时与取消。
+- `frontend/lib/` - API、timeline、拖放、历史、上传、剪映导出等共享逻辑。
 
 ---
 
 ## PRD V1.0 差距分析（ClipTravel）
 
-对照《ClipTravel V1.0 MVP PRD》，当前仓库（`ai-travel-cut`）处于 **「槽位驱动混剪原型」** 阶段：核心闭环可演示，距离 PRD 定义的 **「剪映级交互 + AI 导演引擎」** 仍有大量未开发项。
+> 以下为 2026-06 初的历史对照，**部分条目已在后续迭代中补齐**（DeepSeek 标签、剪映导出、素材快速入库、异步导出等）。保留供产品规划参考。
+
+对照《ClipTravel V1.0 MVP PRD》，当前仓库处于 **「槽位驱动混剪原型 + 剪映导出」** 阶段：核心闭环可演示，距离 PRD 定义的 **「剪映级交互 + AI 导演引擎」** 仍有差距。
 
 **图例**：✅ 已有（可用）　🟡 部分实现　❌ 未开发
 
@@ -563,17 +618,35 @@ URL ?project_id= → 加载项目 timeline
 | **关键帧 / 调色 / 蒙版 / 光流变速** | `effects_engine.py` → FFmpeg `eq`/`scale`/`crop`/`setpts`/`minterpolate`；属性面板 `EffectsPanel` |
 | **100+ 转场** | `transitions.py` + `transitions_catalog.json`，`GET /api/effects/transitions`（120 预设） |
 | **云素材库 / 模板市场 / 抖音 OAuth** | `/api/cloud/*`、`/api/marketplace/*`、`/api/publish/douyin/*`；侧栏云库/市场 Tab；`PublishPanel` |
-| **Celery/Redis** | `celery_app.py`（`USE_CELERY=true` + `REDIS_URL`） |
 | **Milvus/PGVector** | `vector_store.py`（`VECTOR_BACKEND` + `MILVUS_URI` / `PGVECTOR_DSN`，默认 JSON 回退） |
-| **4K NVENC + 代理** | 导出 `use_nvenc` + `pick_video_codec`；上传生成 `proxy_path`（720p） |
+| **4K NVENC + 代理** | 导出 `use_nvenc` + `pick_video_codec`；多档预览代理 |
+| **剪映草稿导出** | `capcut_draft_exporter.py` + CapCut Mate（2026-06-18） |
 
 **新增 API**：`/api/effects/*`、`/api/cloud/*`、`/api/marketplace/*`、`/api/publish/*`、`/api/export/codecs`；导出默认走 **EDL 管线**（`use_edl=true`）
 
-**环境变量（可选）**：`USE_CELERY`、`REDIS_URL`、`VECTOR_BACKEND`、`MILVUS_URI`、`PGVECTOR_DSN`、`DOUYIN_CLIENT_ID`、`DOUYIN_CLIENT_SECRET`
+**环境变量（可选）**：`VECTOR_BACKEND`、`MILVUS_URI`、`PGVECTOR_DSN`、`DOUYIN_CLIENT_ID`、`DOUYIN_CLIENT_SECRET`、`CAPCUT_MATE_BASE_URL`、`PUBLIC_MEDIA_BASE_URL`
 
-**新增 API（Phase A–D）**：`/api/export/render-async`、`/api/export/tasks/{id}`、`/api/template-library/*`、`/api/auth/*`、`/api/v11/status`
+**新增 API（Phase A–D）**：`/api/export/render-async`、`/api/export/capcut-draft`、`/api/export/capcut-status`、`/api/template-library/*`、`/api/auth/*`、`/api/v11/status`
 
 ## 更新日志
+
+### 2026-06-18
+
+#### 1. 剪映草稿导出
+
+- **`capcut_draft_exporter.py`**：裁剪槽位 → CapCut Mate 写入剪映 PC 草稿；支持 BGM、字幕、转场、变速。
+- **可替换模板模式**：`capcut_export_mode=replaceable_template`，占位片段 + 黄色槽位标签 + `slot_manifest.json`。
+- **前端**：预览区导出选项、`capcutExport.ts`、CapCut Mate 状态检测、导出后打开 `draft_url`。
+
+#### 2. 素材快速入库
+
+- **`ASSET_FAST_EDIT_READY`**：先入库可拖拽（约数秒），镜头精分 / 代理 / DeepSeek 标签后台继续。
+- 上传块 16MB；素材库进度 ≥20% 即展示镜头网格；轮询 1s。
+
+#### 3. 预览与工程清理
+
+- 双视频缓冲预加载、时间轴零间隙、切换卡顿优化。
+- 移除 Celery/Redis 依赖与多处死代码；代码已推送至 GitHub。
 
 ### 2026-06-10
 
@@ -700,9 +773,38 @@ POST /api/match/run
 复制示例环境文件并按需修改：
 
 - 前端：`frontend/.env.example` → `frontend/.env.local`
-- 后端：`backend/.env.example` → `backend/.env`（可选 `API_KEY` 开启鉴权）
+- 后端：`backend/.env.example` → `backend/.env`（含 DeepSeek、CapCut Mate、性能开关；**勿提交 Git**）
 
 ## 启动方式
 
-1. 前端：进入 `frontend/`，运行 `npm install`，然后 `npm run dev`
-2. 后端：进入 `backend/`，运行 `pip install -r requirements.txt`，然后 `uvicorn main:app --reload`
+### 1. 后端
+
+```bash
+cd backend
+python -m venv venv
+venv\Scripts\activate          # Windows
+pip install -r requirements.txt
+uvicorn main:app --reload --port 8000
+```
+
+### 2. 前端
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+- 前端：http://localhost:3000
+- 后端：http://127.0.0.1:8000
+- API 文档：http://127.0.0.1:8000/docs
+
+### 3. 剪映导出（可选）
+
+1. 安装剪映 PC 版 + [CapCut Mate](https://github.com/sun-guannan/CapCutMate)
+2. 启动 CapCut Mate（默认端口 30000）
+3. 在 `backend/.env` 配置 `CAPCUT_MATE_BASE_URL` / `PUBLIC_MEDIA_BASE_URL`（局域网场景）
+
+## 许可证
+
+本项目为私有/学习用途，使用前请确认各依赖与 API Key 的使用条款。
