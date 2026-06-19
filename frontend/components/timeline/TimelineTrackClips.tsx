@@ -2,6 +2,7 @@
 
 import type { DragEvent, MouseEvent as ReactMouseEvent } from 'react';
 import { toMediaUrl } from '@/lib/api';
+import { canAcceptTimelineDrop } from '@/lib/timelineDrop';
 import { pseudoWaveform } from '@/lib/timelineLayout';
 import { ClipFilmstrip } from '@/components/timeline/ClipFilmstrip';
 import { TIMELINE_THEME } from './timelineTheme';
@@ -203,6 +204,11 @@ export function CapCutVideoClip({
         if (e.dataTransfer.types.includes('application/x-slot-reorder')) {
           e.preventDefault();
           e.dataTransfer.dropEffect = 'move';
+          return;
+        }
+        if (canAcceptTimelineDrop(e.dataTransfer)) {
+          e.preventDefault();
+          e.dataTransfer.dropEffect = 'copy';
         }
         onDragOver?.(e);
       }}
@@ -214,6 +220,7 @@ export function CapCutVideoClip({
           return;
         }
         onDrop?.(e);
+        e.stopPropagation();
       }}
       className={cn(
         'relative h-full overflow-hidden rounded-[3px]',
@@ -272,17 +279,20 @@ export function CapCutVideoClip({
 
 export function CapCutSubtitleClip({
   text,
+  accentColor,
   selected,
   locked,
   dimmed,
   onClick,
 }: {
   text: string;
+  accentColor?: string;
   selected: boolean;
   locked: boolean;
   dimmed?: boolean;
   onClick: () => void;
 }) {
+  const accent = accentColor && /^#[0-9a-fA-F]{6}$/.test(accentColor) ? accentColor : '#ffffff';
   return (
     <div
       onClick={onClick}
@@ -302,7 +312,9 @@ export function CapCutSubtitleClip({
     >
       <ClipTrimHandles selected={selected && !locked} />
       <CapCutSubtitleIcon />
-      <span className="truncate text-[9px] font-semibold text-white">{text}</span>
+      <span className="truncate text-[9px] font-semibold" style={{ color: accent }}>
+        {text}
+      </span>
     </div>
   );
 }

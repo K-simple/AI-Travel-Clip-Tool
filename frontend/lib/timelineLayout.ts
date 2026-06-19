@@ -1,5 +1,5 @@
 import type { TemplateSlot } from './timeline';
-import { getSlotRange, parseSubtitleSegments, type SubtitleSegment } from './slotEdit';
+import { parseSubtitleSegments, type SubtitleSegment } from './slotEdit';
 
 export type ClipLayout = {
   slot: TemplateSlot;
@@ -21,11 +21,18 @@ export type SegmentLayout = {
 export function buildClipLayouts(slots: TemplateSlot[], pxPerSec: number): ClipLayout[] {
   let cursor = 0;
   return slots.map((slot) => {
-    const { start, end } = getSlotRange(slot, cursor);
+    const duration = Math.max(0.1, slot.duration);
+    const start = cursor;
+    const end = start + duration;
     cursor = end;
-    const left = start * pxPerSec;
-    const width = Math.max(slot.duration * pxPerSec, 28);
-    return { slot, start, end, left, width };
+    const span = end - start;
+    return {
+      slot,
+      start,
+      end,
+      left: start * pxPerSec,
+      width: Math.max(span * pxPerSec, 28),
+    };
   });
 }
 
@@ -34,7 +41,9 @@ export function buildSubtitleSegmentLayouts(slots: TemplateSlot[], pxPerSec: num
   let cursor = 0;
 
   for (const slot of slots) {
-    const { start: slotStart, end: slotEnd } = getSlotRange(slot, cursor);
+    const duration = Math.max(0.1, slot.duration);
+    const slotStart = cursor;
+    const slotEnd = slotStart + duration;
     cursor = slotEnd;
 
     const segments = parseSubtitleSegments(slot.subtitle_segments);
@@ -59,7 +68,7 @@ export function buildSubtitleSegmentLayouts(slots: TemplateSlot[], pxPerSec: num
         start: slotStart,
         end: slotEnd,
         left: slotStart * pxPerSec,
-        width: Math.max(slot.duration * pxPerSec, 28),
+        width: Math.max(duration * pxPerSec, 28),
       });
     }
   }

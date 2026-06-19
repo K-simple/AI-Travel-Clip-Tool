@@ -8,7 +8,6 @@ from models.database import SessionLocal
 from services.asset_analyzer import analyze_asset_fast, enrich_segments
 from services.processing_config import (
     ASSET_FAST_EDIT_READY,
-    ASSET_QUICK_SEGMENTS,
     DEFER_ASSET_AI_LABELS,
     DEFER_ASSET_PROXIES,
     SKIP_CLIP,
@@ -34,8 +33,8 @@ def build_quick_segments(
     raw = build_interval_segments(
         duration,
         TEMPLATE_SLOT_INTERVAL,
-        video_path="" if ASSET_QUICK_SEGMENTS else file_path,
-        thumb_dir="" if ASSET_QUICK_SEGMENTS else (thumb_dir or os.path.dirname(thumb_path)),
+        video_path=file_path,
+        thumb_dir=thumb_dir or os.path.dirname(thumb_path),
     )
     if not raw:
         return [
@@ -63,8 +62,6 @@ def build_quick_segments(
     segments = []
     for i, seg in enumerate(raw):
         thumb = seg.get("thumbnail") or thumb_path
-        if ASSET_QUICK_SEGMENTS and thumb_path:
-            thumb = thumb_path
         segments.append({
             **seg,
             "segment_id": seg.get("segment_id") or f"seg_{i + 1}",
@@ -108,7 +105,7 @@ def process_asset_intake(asset_id: str, task_id: Optional[str] = None) -> dict:
 
         if task_id:
             update_task(task_id, progress=8, message="读取视频信息…")
-        asset.processing_progress = 8
+        asset.processing_progress = max(asset.processing_progress or 0, 12)
         db.commit()
 
         duration = get_video_duration(file_path)

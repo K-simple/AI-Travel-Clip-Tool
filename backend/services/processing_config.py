@@ -103,3 +103,29 @@ ENABLE_AI_LABELS = os.getenv("ENABLE_AI_LABELS", "1").strip().lower() in (
     "yes",
 )
 AI_LABEL_MAX_ITEMS = int(os.getenv("AI_LABEL_MAX_ITEMS", "80"))
+
+# 模板成片级 AI 视觉理解（多帧摘要 + 槽位替换建议，需 DEEPSEEK_API_KEY）
+ENABLE_TEMPLATE_VISION = os.getenv("ENABLE_TEMPLATE_VISION", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+TEMPLATE_VISION_MAX_FRAMES = int(os.getenv("TEMPLATE_VISION_MAX_FRAMES", "6"))
+
+# 字幕花字样式分析（OpenCV 帧差 + 可选 DeepSeek 视觉）
+ENABLE_SUBTITLE_STYLE_ANALYSIS = os.getenv("ENABLE_SUBTITLE_STYLE_ANALYSIS", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+SUBTITLE_STYLE_MAX_SEGMENTS = int(os.getenv("SUBTITLE_STYLE_MAX_SEGMENTS", "40"))
+
+# 音效点位检测（librosa onset + 节拍过滤）
+ENABLE_SFX_DETECTION = os.getenv("ENABLE_SFX_DETECTION", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+SFX_BEAT_TOLERANCE_SEC = float(os.getenv("SFX_BEAT_TOLERANCE_SEC", "0.08"))
+SFX_MIN_ENERGY = float(os.getenv("SFX_MIN_ENERGY", "0.018"))
+SFX_MIN_INTERVAL_SEC = float(os.getenv("SFX_MIN_INTERVAL_SEC", "0.15"))

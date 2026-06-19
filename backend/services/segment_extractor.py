@@ -13,30 +13,53 @@ def extract_segment_video(
     start_sec: float,
     end_sec: float,
     output_path: str,
+    *,
+    allow_stream_copy: bool = False,
+    include_audio: bool = True,
 ) -> bool:
-    """从原片切出 [start, end) 视频片段。"""
+    """从原片切出 [start, end) 视频片段。
+
+    默认重编码并在 -i 之后 seek，避免 -c copy + 前置 -ss 在非关键帧处
+    出现开头重复/抽搐帧。仅当 allow_stream_copy=True 且 copy 成功时才走流复制。
+    """
     if not source_path or not os.path.exists(source_path):
         return False
 
-    duration = max(0.1, float(end_sec) - float(start_sec))
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    start = max(0.0, float(start_sec))
+    duration = max(0.1, float(end_sec) - start)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
-    # 先尝试流复制（快），失败则重编码
-    for mode in ("copy", "encode"):
-        cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(max(0, start_sec)),
-            "-i", source_path,
-            "-t", str(duration),
-        ]
+    modes = ("copy", "encode") if allow_stream_copy else ("encode",)
+    for mode in modes:
         if mode == "copy":
-            cmd += ["-c", "copy", "-avoid_negative_ts", "make_zero"]
-        else:
-            cmd += [
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", str(start),
+                "-i", source_path,
+                "-t", str(duration),
+                "-c", "copy",
+                "-avoid_negative_ts", "make_zero",
+                "-movflags", "+faststart",
+                output_path,
             ]
-        cmd += ["-movflags", "+faststart", output_path]
+        else:
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", source_path,
+                "-ss", str(start),
+                "-t", str(duration),
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-pix_fmt", "yuv420p",
+            ]
+            if include_audio:
+                cmd += ["-c:a", "aac", "-b:a", "128k"]
+            else:
+                cmd += ["-an"]
+            cmd += [
+                "-avoid_negative_ts", "make_zero",
+                "-movflags", "+faststart",
+                output_path,
+            ]
 
         try:
             run_cmd(cmd)
@@ -46,6 +69,40 @@ def extract_segment_video(
             print(f"片段切割失败 ({mode}): {exc}")
 
     return False
+
+
+def extract_segment_audio(
+    source_path: str,
+    start_sec: float,
+    duration_sec: float,
+    output_path: str,
+) -> bool:
+    """从原片切出人声/音频片段（AAC），供剪映草稿独立音轨使用。"""
+    if not source_path or not os.path.exists(source_path):
+        return False
+
+    start = max(0.0, float(start_sec))
+    duration = max(0.08, float(duration_sec))
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", source_path,
+        "-ss", str(start),
+        "-t", str(duration),
+        "-vn",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-ar", "44100",
+        "-ac", "2",
+        output_path,
+    ]
+    try:
+        run_cmd(cmd)
+        return file_ok(output_path)
+    except Exception as exc:
+        print(f"音频片段切割失败: {exc}")
+        return False
 
 
 def attach_segment_videos(

@@ -1,4 +1,5 @@
 import type { TrackKey } from '@/lib/trackControls';
+import { resolveTrackHeight, type TrackHeightMap } from '@/lib/trackHeights';
 
 export type TimelineTrackDef = {
   key: TrackKey;
@@ -32,9 +33,12 @@ export function sortTrackKeys(keys: TrackKey[]): TrackKey[] {
   return ORDER.filter((k) => set.has(k));
 }
 
-export function buildActiveTrackLayout(keys: TrackKey[]): TimelineTrackDef[] {
+export function buildActiveTrackLayout(keys: TrackKey[], heights?: TrackHeightMap): TimelineTrackDef[] {
   const sorted = sortTrackKeys(keys);
-  return ALL_TRACK_LAYOUT.filter((t) => sorted.includes(t.key));
+  return ALL_TRACK_LAYOUT.filter((t) => sorted.includes(t.key)).map((t) => ({
+    ...t,
+    height: resolveTrackHeight(t.key, heights),
+  }));
 }
 
 export function getAddableTracks(activeKeys: TrackKey[]): TimelineTrackDef[] {

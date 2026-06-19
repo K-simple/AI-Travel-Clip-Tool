@@ -73,7 +73,7 @@
 | 素材 | `/api/assets` | `POST /upload`、`GET /list`、`GET /{id}/status`、`GET /tasks/{task_id}`、`POST /{id}/reprocess`、`DELETE /{id}` | 旅途素材上传、CLIP 分析、分段切片、进度轮询与删除 |
 | 匹配 | `/api/match` | `POST /run`、`PUT /replace` | AI 自动匹配槽位、手动替换槽位素材 |
 | 字幕 | `/api/subtitle` | `POST /recognize`、`POST /recognize-slot` | 整文件语音识别、按槽位时间范围识别字幕 |
-| 导出 | `/api/export` | `POST /render`、`POST /render-async`、`POST /capcut-draft`、`GET /capcut-status`、`GET /tasks/{task_id}`、`GET /codecs` | 同步/异步导出 MP4、剪映草稿导出、CapCut Mate 连通性检测 |
+| 导出 | `/api/export` | `POST /render`、`POST /render-async`、`POST /capcut-draft`、`POST /capcut-draft-async`、`GET /capcut-status`、`GET /tasks/{task_id}`、`GET /codecs` | 同步/异步导出 MP4、剪映草稿导出（含进度轮询）、CapCut Mate 连通性检测 |
 | 项目 | `/api/projects` | `POST /create`、`POST /from-template`、`POST /{id}/refresh-from-template`、`GET /list`、`GET /{id}`、`PUT /{id}/timeline` | 项目 CRUD、从模板初始化、保存时间轴 |
 | 任务 | `/api/tasks` | `GET /{task_id}` | 通用后台任务状态查询 |
 | 认证 | `/api/auth` | `GET /status`、`POST /register`、`POST /login` | 用户注册登录（可选，MVP 占位） |
@@ -279,7 +279,9 @@ URL ?project_id= → 加载项目 timeline
 ### 相关 API
 
 - `GET /api/export/capcut-status` — 检测小助手是否就绪
-- `POST /api/export/capcut-draft` — 请求体含 `capcut_export_mode`: `filled` | `replaceable_template`
+- `POST /api/export/capcut-draft` — 同步导出剪映草稿
+- `POST /api/export/capcut-draft-async` — 异步导出（轮询 `GET /api/export/tasks/{task_id}` 获取进度）
+- 请求体含 `capcut_export_mode`: `filled` | `replaceable_template`
 
 ---
 

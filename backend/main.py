@@ -4,7 +4,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 BACKEND_ROOT = Path(__file__).resolve().parent
-load_dotenv(BACKEND_ROOT / ".env")
+load_dotenv(BACKEND_ROOT / ".env", override=True)
 os.chdir(BACKEND_ROOT)
 
 from fastapi import FastAPI

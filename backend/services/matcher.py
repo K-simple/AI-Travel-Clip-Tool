@@ -112,12 +112,21 @@ def match_slots(
         best_detail: Optional[dict] = None
         slot_duration = float(slot.get("duration", slot.get("slot_duration", 0)) or 0)
         current_slot_id = _slot_id(slot, index)
+        duration_tolerance = max(1.0, cfg.duration_tolerance)
 
         for seg in all_segments:
             seg_key = f"{seg.get('asset_id')}_{seg.get('segment_id')}"
 
             if dedup_global and seg_key in used:
                 continue
+
+            seg_dur = float(seg.get("duration", 0) or 0)
+            if seg_dur < slot_duration:
+                continue
+            if strict_duration and slot_duration > 0:
+                ratio = seg_dur / slot_duration
+                if ratio > duration_tolerance:
+                    continue
 
             dur_score = calculate_duration_score(
                 slot_duration,

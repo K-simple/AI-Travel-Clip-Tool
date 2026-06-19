@@ -1,8 +1,10 @@
 'use client';
 
 import EffectsPanel from '@/components/EffectsPanel';
+import { describeSubtitleStyle, parseSubtitleSegments, type SfxMarker } from '@/lib/slotEdit';
 import { isTrackLocked, type TrackControls, type TrackKey } from '@/lib/trackControls';
 import type { MatchStrategy } from '@/lib/matchStrategy';
+import type { TemplateAiVision } from '@/lib/useTemplateProcessing';
 import { DEFAULT_SLOT_EFFECTS, type SlotEffects } from '@/lib/slotEffects';
 
 export type MatchWeights = {
@@ -19,6 +21,7 @@ type SelectedSlot = {
   useOriginalAudio: boolean;
   clipStart: number;
   subtitleText: string;
+  subtitle_segments?: unknown[];
   match_score?: number;
   match_reason?: string;
   locked?: boolean;
@@ -27,6 +30,8 @@ type SelectedSlot = {
   scene_tags?: string[];
   ai_description?: string;
   ai_tags?: string[];
+  ai_replace_hint?: string;
+  ai_subject?: string;
   speed?: number;
   opticalFlow?: boolean;
   keyframes?: SlotEffects['keyframes'];
@@ -50,6 +55,8 @@ type PropertiesPanelProps = {
   matchStrategy: MatchStrategy;
   templateName: string;
   slotCount: number;
+  templateAiVision?: TemplateAiVision;
+  sfxMarkers?: SfxMarker[];
   templateMusicEnabled: boolean;
   matching: boolean;
   matchMessage: string;
@@ -74,9 +81,9 @@ type PropertiesPanelProps = {
 
 function ParamRow({ label, value }: { label: string; value: string }) {
   return (
-    <div className="flex items-start justify-between gap-2 border-b border-[#2e2e2e] py-2 text-xs">
-      <span className="shrink-0 text-[#8b8b8b]">{label}</span>
-      <span className="text-right text-[#e5e5e5]">{value}</span>
+    <div className="flex items-start justify-between gap-3 rounded-lg px-1 py-2.5 text-xs even:bg-editor-panel-2/40">
+      <span className="shrink-0 text-editor-muted">{label}</span>
+      <span className="text-right font-medium text-editor-text">{value}</span>
     </div>
   );
 }
@@ -141,6 +148,8 @@ export default function PropertiesPanel({
   matchStrategy,
   templateName,
   slotCount,
+  templateAiVision,
+  sfxMarkers = [],
   templateMusicEnabled,
   matching,
   matchMessage,
@@ -163,6 +172,9 @@ export default function PropertiesPanel({
   slotOrderTotal = 0,
 }: PropertiesPanelProps) {
   const hasTemplate = !!templateId && slotCount > 0;
+  const subtitleStyleHint = selectedSlot
+    ? describeSubtitleStyle(parseSubtitleSegments(selectedSlot.subtitle_segments)[0]?.style)
+    : '';
   const durationWeight = Math.max(0, 1 - matchWeights.tags_weight - matchWeights.visual_weight);
   const clipMax = Math.max(selectedSlot?.duration ?? 0, assetDurationSeconds ?? 30);
   const videoLocked = isTrackLocked(trackControls, 'video');
@@ -174,25 +186,63 @@ export default function PropertiesPanel({
   };
 
   return (
-    <aside className="flex h-full min-h-0 w-[260px] shrink-0 flex-col border-r border-[#2e2e2e] bg-[#1e1e1e]">
-      <div className="border-b border-[#2e2e2e] px-4 py-3">
-        <h2 className="text-sm font-medium text-white">草稿参数</h2>
-        <p className="mt-0.5 text-[10px] text-[#666]">{templateName}</p>
+    <aside className="ui-panel flex h-full max-h-[min(20vh,200px)] min-h-0 w-full min-w-0 flex-col overflow-hidden lg:max-h-none">
+      <div className="ui-panel-header shrink-0">
+        <h2 className="ui-panel-title">草稿参数</h2>
+        <p className="ui-panel-subtitle">{templateName || '尚未选择模板'}</p>
+        {hasTemplate ? (
+          <div className="mt-3 rounded-lg border border-editor-border bg-editor-panel-2 p-2.5">
+            <div className="mb-2 text-xs font-semibold text-editor-text">智能字幕识别</div>
+            <div className="mb-2 text-[10px] leading-relaxed text-editor-subtle">
+              先人声/BGM 分离再转写，质量不佳时自动回退画面 OCR
+            </div>
+            <div className="flex flex-col gap-1.5">
+              {onRecognizeAllSubtitles ? (
+                <button
+                  type="button"
+                  onClick={onRecognizeAllSubtitles}
+                  disabled={recognizingAllSubtitles || !templateId}
+                  className="ui-btn-primary w-full py-1.5 text-[11px]"
+                >
+                  {recognizingAllSubtitles ? '批量识别中…' : '批量识别全部槽位'}
+                </button>
+              ) : null}
+              {onRecognizeSlotSubtitle ? (
+                <button
+                  type="button"
+                  onClick={onRecognizeSlotSubtitle}
+                  disabled={
+                    recognizingSubtitle ||
+                    !templateId ||
+                    !selectedSlot ||
+                    subtitleLocked
+                  }
+                  className="ui-btn w-full py-1.5 text-[11px]"
+                >
+                  {recognizingSubtitle
+                    ? '识别当前槽位中…'
+                    : selectedSlot
+                      ? '识别当前槽位字幕'
+                      : '请先在时间轴选择槽位'}
+                </button>
+              ) : null}
+            </div>
+            <p className="mt-2 text-[10px] leading-relaxed text-editor-subtle">
+              也可在左侧「字幕」标签页中批量识别画面字幕与编辑
+            </p>
+          </div>
+        ) : null}
       </div>
 
-      <div className="flex-1 overflow-y-auto px-4">
+      <div className="panel-scroll flex-1 overflow-y-auto px-4 py-2">
         {!hasTemplate ? (
-          <div className="flex flex-col items-center justify-center py-8 text-center">
-            <p className="text-xs text-[#8b8b8b]">尚未导入模板</p>
-            <p className="mt-2 text-[10px] leading-relaxed text-[#555]">
+          <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-editor-border bg-editor-panel-2/50 px-4 py-10 text-center">
+            <p className="text-sm font-medium text-editor-muted">尚未导入模板</p>
+            <p className="mt-2 max-w-[220px] text-xs leading-relaxed text-editor-subtle">
               从左侧「导入」拖入模板视频，或点击顶部「导入模板」开始剪辑
             </p>
             {onImportTemplate ? (
-              <button
-                type="button"
-                onClick={onImportTemplate}
-                className="mt-4 rounded-md bg-[#face15] px-4 py-2 text-xs font-semibold text-black hover:bg-[#ffe066]"
-              >
+              <button type="button" onClick={onImportTemplate} className="ui-btn-primary mt-5">
                 导入模板视频
               </button>
             ) : null}
@@ -201,9 +251,30 @@ export default function PropertiesPanel({
           <>
         <ParamRow label="模板名称" value={templateName} />
         <ParamRow label="槽位数量" value={`${slotCount} 个`} />
+        {sfxMarkers.length > 0 ? (
+          <ParamRow label="音效点位" value={`${sfxMarkers.length} 个（音频轨橙色标记）`} />
+        ) : null}
         <ParamRow label="比例" value="9:16" />
         <ParamRow label="分辨率" value="1080×1920" />
         <ParamRow label="模板音乐" value={templateMusicEnabled ? '已开启' : '已关闭'} />
+        {templateAiVision?.summary ? (
+          <div className="mt-3 rounded-md border border-[#3a3520] bg-[#1a1810] p-2.5">
+            <div className="mb-1.5 text-xs font-medium text-[#face15]">AI 模板理解</div>
+            <p className="text-[11px] leading-relaxed text-[#ddd]">{templateAiVision.summary}</p>
+            {templateAiVision.style || templateAiVision.pacing ? (
+              <p className="mt-1 text-[10px] text-[#888]">
+                {[templateAiVision.style, templateAiVision.pacing, templateAiVision.mood]
+                  .filter(Boolean)
+                  .join(' · ')}
+              </p>
+            ) : null}
+            {templateAiVision.replace_guide ? (
+              <p className="mt-1.5 text-[10px] leading-relaxed text-[#aaa]">
+                替换建议：{templateAiVision.replace_guide}
+              </p>
+            ) : null}
+          </div>
+        ) : null}
           </>
         )}
 
@@ -250,6 +321,12 @@ export default function PropertiesPanel({
               <ParamRow label="镜头类型" value={selectedSlot.shot_type || '未知'} />
               {selectedSlot.ai_description ? (
                 <ParamRow label="AI 画面描述" value={selectedSlot.ai_description} />
+              ) : null}
+              {selectedSlot.ai_replace_hint ? (
+                <ParamRow label="替换建议" value={selectedSlot.ai_replace_hint} />
+              ) : null}
+              {selectedSlot.ai_subject ? (
+                <ParamRow label="画面主体" value={selectedSlot.ai_subject} />
               ) : null}
               {selectedSlot.match_score !== undefined ? (
                 <ParamRow label="匹配分" value={`${Math.round(selectedSlot.match_score * 100)}%`} />
@@ -302,11 +379,16 @@ export default function PropertiesPanel({
                 onClick={onRecognizeSlotSubtitle}
                 className="mt-2 w-full rounded bg-[#2a3a55] py-1.5 text-xs text-[#93c5fd] hover:bg-[#334866] disabled:cursor-not-allowed disabled:opacity-40"
               >
-                {recognizingSubtitle ? 'AI 识别人声中…' : 'AI 根据人声识别字幕'}
+                {recognizingSubtitle ? '智能识别中…' : '识别当前槽位字幕'}
               </button>
               <p className="mt-1 text-[10px] leading-relaxed text-[#666]">
-                从模板截取的人声片段识别文字，并更新当前槽位字幕轨
+                先人声分离再转写，必要时自动使用画面烧录字幕 OCR
               </p>
+              {subtitleStyleHint ? (
+                <p className="mt-2 rounded border border-[#3a3a3a] bg-[#141414] px-2 py-1.5 text-[10px] leading-relaxed text-[#face15]/90">
+                  花字样式：{subtitleStyleHint}
+                </p>
+              ) : null}
               <div className="mt-2 flex gap-2">
                 <button
                   type="button"

@@ -11,6 +11,7 @@ type OnboardingGuideProps = {
   progressPercent: number;
   allDone: boolean;
   onStepAction?: (stepId: OnboardingStepId) => void;
+  exportBusy?: { label: string; progress: number } | null;
 };
 
 export default function OnboardingGuide({
@@ -19,6 +20,7 @@ export default function OnboardingGuide({
   progressPercent,
   allDone,
   onStepAction,
+  exportBusy = null,
 }: OnboardingGuideProps) {
   const [collapsed, setCollapsed] = useState(false);
   const [dismissed, setDismissed] = useState(true);
@@ -42,34 +44,29 @@ export default function OnboardingGuide({
 
   if (dismissed && allDone) return null;
 
+  const barProgress = exportBusy ? exportBusy.progress : progressPercent;
+  const progressLabel = exportBusy ? exportBusy.label : `完成度 ${progressPercent}%`;
+
   return (
-    <div className="shrink-0 border-b border-[#2e2e2e] bg-[#181818] px-4 py-2">
-      <div className="mb-2 flex items-center justify-between gap-2">
-        <div className="flex items-center gap-2">
-          <span className="text-xs font-medium text-white">新手引导</span>
+    <div className="shrink-0 border-b border-editor-border bg-editor-panel/70 px-3 py-2.5 backdrop-blur-sm sm:px-5">
+      <div className="mb-2.5 flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2.5">
+          <span className="text-xs font-semibold text-editor-text">快速上手</span>
           {!allDone ? (
-            <span className="text-[10px] text-[#888]">
-              当前：{steps.find((s) => s.id === currentStep)?.title.replace(/^\d+\.\s*/, '')}
+            <span className="rounded-full bg-editor-elevated px-2 py-0.5 text-[10px] text-editor-muted">
+              {steps.find((s) => s.id === currentStep)?.title.replace(/^\d+\.\s*/, '')}
             </span>
           ) : (
-            <span className="text-[10px] text-[#4ade80]">全部完成，可以导出了</span>
+            <span className="text-[10px] font-medium text-editor-success">全部完成，可以导出了</span>
           )}
         </div>
         <div className="flex items-center gap-2">
-          <span className="text-[10px] text-[#666]">匹配进度 {progressPercent}%</span>
-          <button
-            type="button"
-            onClick={() => setCollapsed((v) => !v)}
-            className="text-[10px] text-[#888] hover:text-white"
-          >
+          <span className="text-[10px] text-editor-subtle">{progressLabel}</span>
+          <button type="button" onClick={() => setCollapsed((v) => !v)} className="ui-btn-ghost">
             {collapsed ? '展开' : '收起'}
           </button>
           {allDone ? (
-            <button
-              type="button"
-              onClick={handleDismiss}
-              className="text-[10px] text-[#888] hover:text-white"
-            >
+            <button type="button" onClick={handleDismiss} className="ui-btn-ghost">
               不再显示
             </button>
           ) : null}
@@ -81,12 +78,12 @@ export default function OnboardingGuide({
           {steps.map((step, index) => {
             const stepNum = index + 1;
             const stateClass = step.done
-              ? 'border-[#2d4a2d] bg-[#1a2e1a] text-[#4ade80]'
+              ? 'border-emerald-500/25 bg-emerald-500/10 text-editor-success'
               : step.active
-                ? 'border-[#face15]/50 bg-[#2a2818] text-white'
+                ? 'border-editor-accent/40 bg-editor-accent-muted text-editor-text shadow-glow'
                 : step.locked
-                  ? 'border-[#2a2a2a] bg-[#1a1a1a] text-[#555] cursor-not-allowed'
-                  : 'border-[#333] bg-[#222] text-[#aaa] hover:border-[#444]';
+                  ? 'cursor-not-allowed border-editor-border bg-editor-panel-2 text-editor-subtle opacity-60'
+                  : 'border-editor-border bg-editor-panel-2 text-editor-muted hover:border-editor-border hover:bg-editor-elevated';
 
             return (
               <button
@@ -94,24 +91,24 @@ export default function OnboardingGuide({
                 type="button"
                 disabled={step.locked && !step.done}
                 onClick={() => onStepAction?.(step.id)}
-                className={`flex min-w-[140px] flex-1 flex-col rounded-md border px-3 py-2 text-left transition-colors ${stateClass}`}
+                className={`flex min-w-[148px] flex-1 flex-col rounded-xl border px-3 py-2.5 text-left transition-all duration-150 ${stateClass}`}
                 title={step.description}
               >
                 <div className="flex items-center gap-2">
                   <span
                     className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[10px] font-bold ${
                       step.done
-                        ? 'bg-[#4ade80] text-black'
+                        ? 'bg-editor-success text-[#0f1012]'
                         : step.active
-                          ? 'bg-[#face15] text-black'
-                          : 'bg-[#333] text-[#888]'
+                          ? 'bg-editor-accent text-[#141414]'
+                          : 'bg-editor-elevated text-editor-muted'
                     }`}
                   >
                     {step.done ? '✓' : stepNum}
                   </span>
                   <span className="text-xs font-medium">{step.title.replace(/^\d+\.\s*/, '')}</span>
                 </div>
-                <p className="mt-1 pl-7 text-[10px] leading-snug opacity-80">{step.description}</p>
+                <p className="mt-1.5 pl-7 text-[10px] leading-snug opacity-85">{step.description}</p>
               </button>
             );
           })}
@@ -119,11 +116,12 @@ export default function OnboardingGuide({
       ) : null}
 
       {!allDone && !collapsed ? (
-        <div className="mt-2 h-1 overflow-hidden rounded-full bg-[#2a2a2a]">
-          <div
-            className="h-full bg-[#face15] transition-all duration-500"
-            style={{ width: `${Math.max(4, progressPercent)}%` }}
-          />
+        <div className="ui-progress-track mt-2.5">
+          {exportBusy && exportBusy.progress <= 0 ? (
+            <div className="status-indeterminate-bar ui-progress-fill w-2/5" />
+          ) : (
+            <div className="ui-progress-fill" style={{ width: `${Math.max(4, barProgress)}%` }} />
+          )}
         </div>
       ) : null}
     </div>

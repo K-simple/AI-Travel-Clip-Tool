@@ -1,6 +1,7 @@
 /** 预览区画幅与画质（仅影响播放，不影响导出） */
 
 export type AspectRatioId =
+  | 'auto'
   | '9:16'
   | '16:9'
   | '4:3'
@@ -68,6 +69,7 @@ export type QualityAvailability = {
 export const PREVIEW_QUALITY_STORAGE_KEY = 'editor-preview-quality';
 
 export const ASPECT_RATIO_PRESETS: AspectRatioPreset[] = [
+  { id: 'auto', label: '原画', ratio: 9 / 16 },
   { id: '9:16', label: '9:16', ratio: 9 / 16 },
   { id: '16:9', label: '16:9', ratio: 16 / 9 },
   { id: '4:3', label: '4:3', ratio: 4 / 3 },
@@ -79,6 +81,30 @@ export const ASPECT_RATIO_PRESETS: AspectRatioPreset[] = [
   { id: '2.35:1', label: '2.35:1', ratio: 2.35 },
   { id: '1.85:1', label: '1.85:1', ratio: 1.85 },
 ];
+
+/** 在容器内按画幅比例计算预览舞台尺寸（object-fit: contain 逻辑） */
+export function fitPreviewStageSize(
+  containerWidth: number,
+  containerHeight: number,
+  aspectRatio: number,
+  padding = 12
+): { width: number; height: number } {
+  if (containerWidth <= 0 || containerHeight <= 0 || aspectRatio <= 0) {
+    return { width: 0, height: 0 };
+  }
+  const maxW = Math.max(0, containerWidth - padding * 2);
+  const maxH = Math.max(0, containerHeight - padding * 2);
+  let width = maxW;
+  let height = width / aspectRatio;
+  if (height > maxH) {
+    height = maxH;
+    width = height * aspectRatio;
+  }
+  return {
+    width: Math.max(1, Math.floor(width)),
+    height: Math.max(1, Math.floor(height)),
+  };
+}
 
 export const PREVIEW_QUALITY_PRESETS: PreviewQualityPreset[] = [
   {

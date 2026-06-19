@@ -3,12 +3,13 @@ import shutil
 import time
 import uuid
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy.orm import Session
 
 from models.database import Asset, get_db
 from services.asset_processor import build_quick_segments, process_asset_full
 from services.proxy_generator import normalize_proxy_paths
+from services.scene_detector import extract_frame, get_video_duration
 from services.task_queue import create_task, get_task, run_task
 from utils.upload_stream import save_upload_stream
 
@@ -31,6 +32,21 @@ def _cleanup_asset_files(asset: Asset):
                 pass
 
 
+_SEGMENT_API_SKIP = frozenset(
+    {"clip_embedding", "ref_keyframe_emb", "embedding", "file_path"}
+)
+
+
+def _public_segment(seg) -> dict:
+    if not isinstance(seg, dict):
+        return seg
+    return {k: v for k, v in seg.items() if k not in _SEGMENT_API_SKIP}
+
+
+def _public_segments(segments) -> list:
+    return [_public_segment(s) for s in (segments or [])]
+
+
 def _asset_to_dict(asset: Asset, *, include_segments: bool = False) -> dict:
     proxy_paths = normalize_proxy_paths(getattr(asset, "proxy_paths", None))
     data = {
@@ -46,7 +62,7 @@ def _asset_to_dict(asset: Asset, *, include_segments: bool = False) -> dict:
         "processing_progress": getattr(asset, "processing_progress", 100) or 100,
     }
     if include_segments:
-        data["segments"] = asset.segments or []
+        data["segments"] = _public_segments(asset.segments)
     return data
 
 
@@ -66,21 +82,35 @@ async def upload_asset(
     try:
         await save_upload_stream(file, file_path)
 
+        duration = get_video_duration(file_path)
+        main_thumb = os.path.join(thumb_dir, "main.jpg").replace("\\", "/")
+        if duration > 0:
+            extract_frame(file_path, max(duration / 2, 0.5), main_thumb)
+        else:
+            extract_frame(file_path, 0.5, main_thumb)
+        if not os.path.isfile(main_thumb):
+            main_thumb = ""
+
         quick_segments = build_quick_segments(
-            0, file_path, "", asset_id, file.filename or safe_filename
+            duration,
+            file_path,
+            main_thumb,
+            asset_id,
+            file.filename or safe_filename,
+            thumb_dir,
         )
 
         now = time.time()
         asset = Asset(
             id=asset_id,
             filename=file.filename,
-            duration=0,
+            duration=duration,
             file_path=file_path,
-            thumbnail_path="",
+            thumbnail_path=main_thumb,
             segments=quick_segments,
             proxy_path="",
             processing_status="processing",
-            processing_progress=5,
+            processing_progress=12,
             created_at=now,
             updated_at=now,
         )
@@ -91,7 +121,7 @@ async def upload_asset(
         run_task(task_id, lambda: process_asset_full(asset_id, task_id))
 
         payload = _asset_to_dict(asset, include_segments=False)
-        payload["segments"] = quick_segments
+        payload["segments"] = _public_segments(quick_segments)
         payload["processing"] = True
         payload["task_id"] = task_id
         return payload
@@ -116,9 +146,12 @@ def get_asset_task(task_id: str):
 
 
 @router.get("/list")
-def list_assets(db: Session = Depends(get_db)):
+def list_assets(
+    include_segments: bool = Query(False, description="是否返回完整镜头列表（默认仅元数据）"),
+    db: Session = Depends(get_db),
+):
     assets = db.query(Asset).all()
-    return [_asset_to_dict(a, include_segments=True) for a in assets]
+    return [_asset_to_dict(a, include_segments=include_segments) for a in assets]
 
 
 @router.get("/{asset_id}/status")

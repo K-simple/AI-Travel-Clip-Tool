@@ -37,7 +37,13 @@ export function trimClipStart(slot: TemplateSlot, delta: number, maxAsset?: numb
 
 export function trimClipDuration(slot: TemplateSlot, delta: number): TemplateSlot {
   const next = Math.max(0.3, slot.duration + delta);
-  return { ...slot, duration: next, clip_duration: next };
+  const start = slot.slotStart ?? 0;
+  return {
+    ...slot,
+    duration: next,
+    clip_duration: next,
+    slotEnd: start + next,
+  };
 }
 
 /** 按顺序重算 slot_start / slot_end */

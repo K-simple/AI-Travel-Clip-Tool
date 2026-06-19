@@ -2,12 +2,14 @@
 node_modules/
 frontend/.next/
 frontend/out/
+*.tsbuildinfo
 
 # Python
 __pycache__/
 *.py[cod]
 *.sqlite
 backend/venv/
+capcut-mate/venv/
 
 # Environment
 .env
@@ -19,6 +21,10 @@ backend/.env
 backend/storage/
 backend/ai_travel_cut.db
 backend/ai_travel_cut.db-*
+/storage/
+
+# Vendored CapCut Mate (local install, ~2GB; see scripts/start-capcut-mate.ps1)
+capcut-mate/
 
 # Misc
 .DS_Store

@@ -10,8 +10,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from 'react';
-import {
-  buildClipLayouts,
+import { buildClipLayouts,
   buildSubtitleSegmentLayouts,
   findClipAtTime,
   getTotalDuration,
@@ -20,6 +19,7 @@ import {
   type ClipLayout,
   type SegmentLayout,
 } from '@/lib/timelineLayout';
+import { describeSfxMarker } from '@/lib/slotEdit';
 import {
   isTrackContentVisible,
   isTrackLocked,
@@ -38,7 +38,7 @@ import {
   CapCutVideoClip,
   laneGridStyle,
 } from '@/components/timeline/TimelineTrackClips';
-import { canAcceptTimelineDrop } from '@/lib/timelineDrop';
+import { canAcceptTimelineDrop, isFileDrag, isInternalAssetDrag } from '@/lib/timelineDrop';
 import type { TemplateSlot } from '@/lib/timeline';
 import { overlayLayouts, type OverlayClip, type OverlayTracks } from '@/lib/edlModel';
 import { CLIP_GAP, CLIP_INSET, RULER_H, TIMELINE_THEME } from '@/components/timeline/timelineTheme';
@@ -57,6 +57,9 @@ import {
   hasActiveMask,
 } from '@/lib/slotEffects';
 import { fetchTemplateWaveform, sliceWaveformPeaks } from '@/lib/waveform';
+import { clampTrackHeight, type TrackHeightMap } from '@/lib/trackHeights';
+import { TrackResizeHandle } from '@/components/timeline/TrackResizeHandle';
+import type { PointerEvent as ReactPointerEvent } from 'react';
 
 const SLOT_REORDER_MIME = 'application/x-slot-reorder';
 
@@ -81,45 +84,47 @@ type TimelineProps = {
   onDeleteSlot?: (slotId: string) => void;
   onSlotSelect: (slotId: string) => void;
   onTimelineDrop: (event: DragEvent<HTMLDivElement>, time: number, slotId?: string | null) => void;
+  onTimelineDropHint?: (message: string) => void;
   onTrimSlot?: (slotId: string, mode: 'start' | 'end', deltaSec: number) => void;
   overlayTracks?: OverlayTracks;
   onOverlayDrop?: (track: 'v2' | 'v3', time: number, assetId: string) => void;
   onOverlayDelete?: (track: 'v2' | 'v3', clipId: string) => void;
   beatMarkers?: number[];
+  sfxMarkers?: import('@/lib/slotEdit').SfxMarker[];
   loading?: boolean;
   coverThumb?: string;
   onCoverClick?: () => void;
   templateMusicEnabled?: boolean;
   templateId?: string | null;
   onReorderSlots?: (fromSlotId: string, toSlotId: string) => void;
+  trackHeights?: TrackHeightMap;
+  onTrackHeightChange?: (key: TrackKey, height: number | null) => void;
 };
 
 const BASE_PX_PER_SEC = 56;
 
 function HiddenTrackHint({
-  height,
   label,
   selected,
 }: {
-  height: number;
   label: string;
   selected?: boolean;
 }) {
   return (
     <div
-      className={trackLaneClass(!!selected, 'flex items-center px-3 text-[10px] text-[#636366]')}
-      style={{ height, borderColor: TIMELINE_THEME.border }}
+      className={trackLaneClass(!!selected, 'flex h-full items-center px-3 text-[10px] text-[#636366]')}
+      style={{ borderColor: TIMELINE_THEME.border }}
     >
       {label} · 已隐藏
     </div>
   );
 }
 
-function SoloFilteredHint({ height, selected }: { height: number; selected?: boolean }) {
+function SoloFilteredHint({ selected }: { selected?: boolean }) {
   return (
     <div
-      className={trackLaneClass(!!selected, 'flex items-center px-3 text-[10px] text-[#636366]')}
-      style={{ height, borderColor: TIMELINE_THEME.border }}
+      className={trackLaneClass(!!selected, 'flex h-full items-center px-3 text-[10px] text-[#636366]')}
+      style={{ borderColor: TIMELINE_THEME.border }}
     >
       独奏模式中已隐藏
     </div>
@@ -157,17 +162,21 @@ export default function Timeline({
   onTrackControlToggle,
   onSlotSelect,
   onTimelineDrop,
+  onTimelineDropHint,
   onTrimSlot,
   overlayTracks = { v2: [], v3: [] },
   onOverlayDrop,
   onOverlayDelete,
   beatMarkers = [],
+  sfxMarkers = [],
   loading = false,
   coverThumb: coverThumbProp,
   onCoverClick,
   templateMusicEnabled = true,
   templateId,
   onReorderSlots,
+  trackHeights = {},
+  onTrackHeightChange,
 }: TimelineProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const reorderDragIdRef = useRef<string | null>(null);
@@ -234,8 +243,8 @@ export default function Timeline({
   const pxPerSec = BASE_PX_PER_SEC * zoom;
   const totalDuration = getTotalDuration(slots);
   const activeTrackLayout = useMemo(
-    () => buildActiveTrackLayout(visibleTrackKeys),
-    [visibleTrackKeys]
+    () => buildActiveTrackLayout(visibleTrackKeys, trackHeights),
+    [visibleTrackKeys, trackHeights]
   );
   const addableTracks = useMemo(() => getAddableTracks(visibleTrackKeys), [visibleTrackKeys]);
   const contentWidth = Math.max(totalDuration * pxPerSec + 120, viewportWidth, 480);
@@ -257,7 +266,49 @@ export default function Timeline({
   const tickStep = zoom >= 1.8 ? 1 : zoom >= 1 ? 2 : 5;
   const gridStyle = useMemo(() => laneGridStyle(pxPerSec), [pxPerSec]);
 
-  const trackHeight = (key: TrackKey) => getTrackDef(key)?.height ?? 32;
+  const trackHeight = useCallback(
+    (key: TrackKey) => activeTrackLayout.find((t) => t.key === key)?.height ?? getTrackDef(key)?.height ?? 32,
+    [activeTrackLayout]
+  );
+
+  const beginTrackResize = useCallback(
+    (key: TrackKey, event: ReactPointerEvent<HTMLDivElement>) => {
+      if (!onTrackHeightChange) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const startY = event.clientY;
+      const startHeight = trackHeight(key);
+      const pointerId = event.pointerId;
+      const handle = event.currentTarget;
+      handle.setPointerCapture(pointerId);
+
+      const onMove = (ev: PointerEvent) => {
+        onTrackHeightChange(key, clampTrackHeight(startHeight + (ev.clientY - startY)));
+      };
+      const onUp = () => {
+        try {
+          handle.releasePointerCapture(pointerId);
+        } catch {
+          /* ignore */
+        }
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', onUp);
+        window.removeEventListener('pointercancel', onUp);
+      };
+
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+      window.addEventListener('pointercancel', onUp);
+    },
+    [onTrackHeightChange, trackHeight]
+  );
+
+  const resetTrackHeight = useCallback(
+    (key: TrackKey) => {
+      onTrackHeightChange?.(key, null);
+    },
+    [onTrackHeightChange]
+  );
 
   const handleAddTrack = useCallback(
     (key: TrackKey) => {
@@ -514,6 +565,7 @@ export default function Timeline({
       >
         <CapCutSubtitleClip
           text={layout.segment.text}
+          accentColor={layout.segment.style?.text_color}
           selected={layout.slot.id === selectedSlotId}
           locked={locked}
           dimmed={isTrackMuted(trackControls, 'subtitle')}
@@ -532,6 +584,25 @@ export default function Timeline({
     setDragOverVideo(true);
   };
 
+  const forwardAssetDragOver = (e: DragEvent<HTMLDivElement>) => {
+    if (isTrackLocked(trackControls, 'video')) return;
+    const dt = e.dataTransfer;
+    if (!dt || !canAcceptTimelineDrop(dt)) return;
+    if (isFileDrag(dt) || isInternalAssetDrag(dt)) {
+      e.preventDefault();
+      dt.dropEffect = 'copy';
+      setDragOverVideo(true);
+    }
+  };
+
+  const forwardAssetDropToVideo = (e: DragEvent<HTMLDivElement>) => {
+    const dt = e.dataTransfer;
+    if (!canAcceptTimelineDrop(dt)) return;
+    if (isFileDrag(dt) || isInternalAssetDrag(dt)) {
+      handleVideoDrop(e);
+    }
+  };
+
   const handleVideoDragLeave = (e: DragEvent) => {
     const related = e.relatedTarget as Node | null;
     if (related && e.currentTarget.contains(related)) return;
@@ -542,7 +613,10 @@ export default function Timeline({
     e: DragEvent<HTMLDivElement>,
     preferredSlotId?: string | null
   ) => {
-    if (isTrackLocked(trackControls, 'video')) return;
+    if (isTrackLocked(trackControls, 'video')) {
+      onTimelineDropHint?.('视频轨已锁定，请点击左侧轨道头解锁后再拖入素材');
+      return;
+    }
     e.preventDefault();
     setDragOverVideo(false);
     const time = timeFromClientX(e.clientX);
@@ -557,7 +631,10 @@ export default function Timeline({
     const lockKey = laneKey ?? (track === 'v2' ? 'overlay' : 'video2');
     if (isTrackLocked(trackControls, lockKey)) return;
     e.preventDefault();
-    const assetId = e.dataTransfer.getData('application/x-asset-id');
+    const raw =
+      e.dataTransfer.getData('application/x-asset-id') ||
+      e.dataTransfer.getData('text/plain');
+    const assetId = raw.includes(':') ? raw.split(':', 2)[0] : raw;
     if (!assetId || !onOverlayDrop) return;
     const time = timeFromClientX(e.clientX);
     onOverlayDrop(track, time, assetId);
@@ -674,11 +751,7 @@ export default function Timeline({
                     (l.slot.matchedAssetId ? assetMap[l.slot.matchedAssetId]?.filePath : '') ||
                     ''
                   : templateVideoPath || '';
-                const clipStart = segmentFile
-                  ? 0
-                  : hasMatchedAsset
-                    ? (l.slot.clipStart ?? 0)
-                    : (l.slot.slotStart ?? l.slot.clipStart ?? 0);
+                const clipStart = segmentFile ? 0 : (l.slot.clipStart ?? 0);
                 const locked = isTrackLocked(trackControls, 'video') || !!l.slot.locked;
                 const tags = l.slot.ai_tags?.length
                   ? l.slot.ai_tags.map((t) => (t.startsWith('#') ? t : `#${t}`)).join(' ')
@@ -715,11 +788,14 @@ export default function Timeline({
                       if (!locked) handleVideoDragOver(e);
                     }}
                     onDrop={(e) => {
-                      if (!locked) {
-                        e.stopPropagation();
-                        setDragOverVideo(false);
-                        handleVideoDrop(e, l.slot.id);
+                      if (locked) {
+                        e.preventDefault();
+                        onTimelineDropHint?.('该槽位已锁定，请在属性面板取消锁定后再拖入素材');
+                        return;
                       }
+                      e.stopPropagation();
+                      setDragOverVideo(false);
+                      handleVideoDrop(e, l.slot.id);
                     }}
                   />
                 );
@@ -896,7 +972,7 @@ export default function Timeline({
         return subtitleLayouts.length > 0 ? (
           subtitleLayouts.map(renderSubtitleSegment)
         ) : slots.length > 0 ? (
-          <LaneDropHint text="在「文本」侧栏或属性面板编辑字幕" />
+          <LaneDropHint text="在「字幕」侧栏或属性面板编辑字幕" />
         ) : null;
 
       case 'audio':
@@ -910,6 +986,14 @@ export default function Timeline({
                   left: t * pxPerSec,
                   height: trackHeight('audio'),
                 }}
+              />
+            ))}
+            {sfxMarkers.map((marker, i) => (
+              <div
+                key={`audio-sfx-${i}-${marker.time}`}
+                title={describeSfxMarker(marker)}
+                className="pointer-events-none absolute top-1 z-[3] h-2 w-2 -translate-x-1/2 rotate-45 bg-[#f97316] shadow-[0_0_6px_rgba(249,115,22,0.8)]"
+                style={{ left: marker.time * pxPerSec }}
               />
             ))}
             <div
@@ -1006,74 +1090,108 @@ export default function Timeline({
     const isVideo = trackKey === 'video';
 
     if (!ctrl.visible) {
-      return <HiddenTrackHint height={height} label={label} selected={selected} />;
+      return (
+        <div className="group relative shrink-0" style={{ height }}>
+          <HiddenTrackHint label={label} selected={selected} />
+          {onTrackHeightChange ? (
+            <TrackResizeHandle
+              onResizeStart={(e) => beginTrackResize(trackKey, e)}
+              onResizeReset={() => resetTrackHeight(trackKey)}
+            />
+          ) : null}
+        </div>
+      );
     }
     if (!isTrackContentVisible(trackControls, trackKey)) {
-      return <SoloFilteredHint height={height} selected={selected} />;
+      return (
+        <div className="group relative shrink-0" style={{ height }}>
+          <SoloFilteredHint selected={selected} />
+          {onTrackHeightChange ? (
+            <TrackResizeHandle
+              onResizeStart={(e) => beginTrackResize(trackKey, e)}
+              onResizeReset={() => resetTrackHeight(trackKey)}
+            />
+          ) : null}
+        </div>
+      );
     }
 
     const laneLocked = ctrl.locked;
     const laneMuted = isTrackMuted(trackControls, trackKey);
+    const forwardsAssetDrop =
+      !isVideo && trackKey !== 'overlay' && trackKey !== 'video2' && trackKey !== 'sticker';
 
     return (
-      <div
-        className={trackLaneClass(selected, isLast ? 'border-b-0' : undefined)}
-        style={{ height, borderColor: TIMELINE_THEME.border, ...gridStyle }}
-        onMouseDown={(e) => handleTrackBgMouseDown(e, trackKey)}
-        onDragOver={
-          isVideo
-            ? handleVideoDragOver
-            : dropHandler
+      <div className="group relative shrink-0" style={{ height }}>
+        <div
+          className={trackLaneClass(selected, isLast ? 'border-b-0' : undefined)}
+          style={{ height: '100%', borderColor: TIMELINE_THEME.border, ...gridStyle }}
+          onMouseDown={(e) => handleTrackBgMouseDown(e, trackKey)}
+          onDragOver={
+            isVideo
+              ? handleVideoDragOver
+              : forwardsAssetDrop
+                ? forwardAssetDragOver
+                : dropHandler
+                  ? (e) => {
+                      e.preventDefault();
+                      e.dataTransfer.dropEffect = 'copy';
+                    }
+                  : undefined
+          }
+          onDragLeave={isVideo ? handleVideoDragLeave : undefined}
+          onDrop={
+            isVideo
               ? (e) => {
-                  e.preventDefault();
-                  e.dataTransfer.dropEffect = 'copy';
+                  if ((e.target as HTMLElement).closest('[data-clip]')) return;
+                  handleVideoDrop(e);
                 }
-              : undefined
-        }
-        onDragLeave={isVideo ? handleVideoDragLeave : undefined}
-        onDrop={
-          isVideo
-            ? (e) => {
-                if ((e.target as HTMLElement).closest('[data-clip]')) return;
-                handleVideoDrop(e);
-              }
-            : dropHandler
-        }
-      >
-        {selected ? (
-          <div className="pointer-events-none absolute inset-y-0 left-0 z-[6] w-[2px] bg-[#face15]" />
-        ) : null}
-        {laneLocked ? (
-          <div className="pointer-events-none absolute inset-0 z-[5] bg-[repeating-linear-gradient(-45deg,transparent,transparent_6px,rgba(255,179,0,0.05)_6px,rgba(255,179,0,0.05)_12px)]" />
-        ) : null}
-        {laneMuted ? (
-          <div className="pointer-events-none absolute inset-0 z-[5] bg-black/25" />
-        ) : null}
-        {isVideo && slots.length === 0 ? (
-          <div
-            className={`pointer-events-none absolute inset-0 z-10 flex flex-col items-center justify-center border-2 border-dashed transition-colors ${
-              dragOverVideo
-                ? 'border-[#face15] bg-[#face15]/10'
-                : 'border-[#3a3a3c] bg-[#1c1c1e]/80'
-            }`}
-          >
-            <span className="text-xs text-[#e5e5ea]">
-              {dragOverVideo ? '松手导入模板视频' : '拖入模板视频以开始'}
-            </span>
-            <span className="mt-1 text-[10px] text-[#8e8e93]">
-              支持 mp4 / mov / mkv 等格式
-            </span>
+              : forwardsAssetDrop
+                ? forwardAssetDropToVideo
+                : dropHandler
+          }
+        >
+          {selected ? (
+            <div className="pointer-events-none absolute inset-y-0 left-0 z-[6] w-[2px] bg-[#face15]" />
+          ) : null}
+          {laneLocked ? (
+            <div className="pointer-events-none absolute inset-0 z-[5] bg-[repeating-linear-gradient(-45deg,transparent,transparent_6px,rgba(255,179,0,0.05)_6px,rgba(255,179,0,0.05)_12px)]" />
+          ) : null}
+          {laneMuted ? (
+            <div className="pointer-events-none absolute inset-0 z-[5] bg-black/25" />
+          ) : null}
+          {isVideo && slots.length === 0 ? (
+            <div
+              className={`pointer-events-none absolute inset-0 z-10 flex flex-col items-center justify-center border-2 border-dashed transition-colors ${
+                dragOverVideo
+                  ? 'border-[#face15] bg-[#face15]/10'
+                  : 'border-[#3a3a3c] bg-[#1c1c1e]/80'
+              }`}
+            >
+              <span className="text-xs text-[#e5e5ea]">
+                {dragOverVideo ? '松手导入模板视频' : '拖入模板视频以开始'}
+              </span>
+              <span className="mt-1 text-[10px] text-[#8e8e93]">
+                支持 mp4 / mov / mkv 等格式
+              </span>
+                </div>
+          ) : null}
+          {isVideo && slots.length > 0 && dragOverVideo ? (
+            <div className="pointer-events-none absolute inset-0 z-10 border-2 border-dashed border-[#face15] bg-[#face15]/8" />
+          ) : null}
+          {isVideo && loading ? (
+            <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-black/40 text-xs text-[#face15]">
+              上传处理中…
+            </div>
+          ) : null}
+          {content}
           </div>
+        {onTrackHeightChange ? (
+          <TrackResizeHandle
+            onResizeStart={(e) => beginTrackResize(trackKey, e)}
+            onResizeReset={() => resetTrackHeight(trackKey)}
+          />
         ) : null}
-        {isVideo && slots.length > 0 && dragOverVideo ? (
-          <div className="pointer-events-none absolute inset-0 z-10 border-2 border-dashed border-[#face15] bg-[#face15]/8" />
-        ) : null}
-        {isVideo && loading ? (
-          <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-black/40 text-xs text-[#face15]">
-            上传处理中…
-          </div>
-        ) : null}
-        {content}
                   </div>
     );
   };
@@ -1119,6 +1237,8 @@ export default function Timeline({
           onTrackControlToggle={onTrackControlToggle}
           addableTracks={addableTracks}
           onAddTrack={handleAddTrack}
+          onTrackResizeStart={onTrackHeightChange ? beginTrackResize : undefined}
+          onTrackResizeReset={onTrackHeightChange ? resetTrackHeight : undefined}
         />
 
         <div ref={scrollRef} className="timeline-scroll relative min-w-0 flex-1 overflow-x-auto overflow-y-auto">

@@ -83,6 +83,10 @@ def analyze_frame(image_path: str) -> dict:
             logits, _ = model(image, scene_tokens)
             probs = logits.softmax(dim=-1)[0]
 
+            emb = model.encode_image(image)
+            emb = emb / emb.norm(dim=-1, keepdim=True)
+            clip_embedding = [float(x) for x in emb[0].cpu().tolist()]
+
         scene_tags = [
             SCENE_LABELS[i]
             for i in range(len(SCENE_LABELS))
@@ -110,6 +114,7 @@ def analyze_frame(image_path: str) -> dict:
             "scene_tags": scene_tags,
             "shot_type": shot_type,
             "has_person": has_person,
+            "clip_embedding": clip_embedding,
         }
 
     except Exception as e:

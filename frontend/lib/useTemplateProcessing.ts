@@ -2,6 +2,15 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { apiHeaders, apiUrl } from '@/lib/api';
 import type { PreviewProxyPaths } from '@/lib/previewSettings';
 
+export type TemplateAiVision = {
+  summary?: string;
+  style?: string;
+  pacing?: string;
+  mood?: string;
+  narrative?: string;
+  replace_guide?: string;
+};
+
 export type TemplateProcessingState = {
   status: string;
   progress: number;
@@ -11,7 +20,10 @@ export type TemplateProcessingState = {
   audioReady: boolean;
   subtitleReady: boolean;
   beatMarkers: number[];
+  sfxMarkers: import('@/lib/slotEdit').SfxMarker[];
   slotCount: number;
+  slotsAiReadyCount: number;
+  aiVision: TemplateAiVision;
   duration: number;
   proxyPaths: PreviewProxyPaths;
 };
@@ -26,7 +38,10 @@ export function useTemplateProcessing(templateId: string | null) {
     audioReady: false,
     subtitleReady: false,
     beatMarkers: [],
+    sfxMarkers: [],
     slotCount: 0,
+    slotsAiReadyCount: 0,
+    aiVision: {},
     duration: 0,
     proxyPaths: {},
   });
@@ -51,7 +66,10 @@ export function useTemplateProcessing(templateId: string | null) {
         audioReady: !!data.audio_ready,
         subtitleReady: !!data.subtitle_ready,
         beatMarkers: Array.isArray(data.beat_markers) ? data.beat_markers : [],
+        sfxMarkers: Array.isArray(data.sfx_markers) ? data.sfx_markers : [],
         slotCount: Number(data.slot_count ?? 0),
+        slotsAiReadyCount: Number(data.slots_ai_ready_count ?? 0),
+        aiVision: (data.ai_vision as TemplateAiVision) || {},
         duration: Number(data.duration ?? 0),
         proxyPaths: (data.proxy_paths as PreviewProxyPaths) || {},
       });
@@ -79,7 +97,10 @@ export function useTemplateProcessing(templateId: string | null) {
         audioReady: false,
         subtitleReady: false,
         beatMarkers: [],
+        sfxMarkers: [],
         slotCount: 0,
+        slotsAiReadyCount: 0,
+        aiVision: {},
         duration: 0,
         proxyPaths: {},
       });

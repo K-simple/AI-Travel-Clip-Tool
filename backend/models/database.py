@@ -60,6 +60,8 @@ class Template(Base):
     proxy_paths = Column(JSON, default=dict)
     enhance_status = Column(String, default="ready")
     enhance_progress = Column(Integer, default=100)
+    ai_vision_json = Column(JSON, default=dict)
+    sfx_markers = Column(JSON, default=list)
     created_at = Column(Float, default=0.0)
 
 
@@ -113,6 +115,8 @@ def migrate_db():
         "ALTER TABLE templates ADD COLUMN proxy_paths JSON DEFAULT '{}'",
         "ALTER TABLE templates ADD COLUMN enhance_status VARCHAR DEFAULT 'ready'",
         "ALTER TABLE templates ADD COLUMN enhance_progress INTEGER DEFAULT 100",
+        "ALTER TABLE templates ADD COLUMN ai_vision_json JSON DEFAULT '{}'",
+        "ALTER TABLE templates ADD COLUMN sfx_markers JSON DEFAULT '[]'",
     ]
     with engine.connect() as conn:
         for stmt in migrations:

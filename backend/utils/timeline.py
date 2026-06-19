@@ -9,6 +9,8 @@ PRESERVE_IF_EMPTY = (
     "scene_tags",
     "ai_description",
     "ai_tags",
+    "ai_replace_hint",
+    "ai_subject",
     "subtitle_segments",
     "clip_duration",
     "asset_audio_volume",

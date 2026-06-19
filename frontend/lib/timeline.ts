@@ -1,3 +1,5 @@
+import { recalculateSlotTimes } from './slotOps';
+
 export type TemplateSlot = {
   id: string;
   name: string;
@@ -18,6 +20,8 @@ export type TemplateSlot = {
   scene_tags?: string[];
   ai_description?: string;
   ai_tags?: string[];
+  ai_replace_hint?: string;
+  ai_subject?: string;
   subtitle_segments?: unknown[];
   clip_duration?: number;
   asset_audio_volume?: number;
@@ -32,8 +36,21 @@ export type TemplateSlot = {
   transitionOut?: import('@/lib/slotEffects').TransitionOut;
 };
 
+/** 旧时间线可能把模板源时间写在 slot_start；在重排时间轴前保留到 clipStart */
+function ensureTemplateSourceOffset(slots: TemplateSlot[]): TemplateSlot[] {
+  return slots.map((slot) => {
+    const hasAsset = Boolean(slot.matchedAssetId || slot.asset_file_path?.trim());
+    if (hasAsset || slot.clipStart > 0) return slot;
+    const legacySource = slot.slotStart ?? 0;
+    if (legacySource > 0) {
+      return { ...slot, clipStart: legacySource };
+    }
+    return slot;
+  });
+}
+
 export function timelineToSlots(timeline: Record<string, unknown>[]): TemplateSlot[] {
-  return timeline.map((entry, index) => ({
+  const slots = timeline.map((entry, index) => ({
     id: `slot-${entry.slot_id ?? index + 1}`,
     name:
       (entry.ai_description as string) ||
@@ -57,6 +74,8 @@ export function timelineToSlots(timeline: Record<string, unknown>[]): TemplateSl
     scene_tags: (entry.scene_tags as string[]) || [],
     ai_description: (entry.ai_description as string) || undefined,
     ai_tags: (entry.ai_tags as string[]) || [],
+    ai_replace_hint: (entry.ai_replace_hint as string) || undefined,
+    ai_subject: (entry.ai_subject as string) || undefined,
     subtitle_segments: (entry.subtitle_segments as unknown[]) || [],
     clip_duration: entry.clip_duration != null ? Number(entry.clip_duration) : undefined,
     asset_audio_volume:
@@ -71,6 +90,7 @@ export function timelineToSlots(timeline: Record<string, unknown>[]): TemplateSl
     mask: entry.mask as TemplateSlot['mask'],
     transitionOut: entry.transition_out as TemplateSlot['transitionOut'],
   }));
+  return recalculateSlotTimes(ensureTemplateSourceOffset(slots));
 }
 
 export function slotToTimelineEntry(
@@ -90,6 +110,8 @@ export function slotToTimelineEntry(
     scene_tags: slot.scene_tags,
     ai_description: slot.ai_description,
     ai_tags: slot.ai_tags,
+    ai_replace_hint: slot.ai_replace_hint,
+    ai_subject: slot.ai_subject,
     subtitle_segments: slot.subtitle_segments,
     asset_id: slot.matchedAssetId ?? null,
     segment_file_path: slot.segment_file_path,

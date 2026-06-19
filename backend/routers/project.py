@@ -38,40 +38,46 @@ class UpdateProjectRequest(BaseModel):
     cover_thumbnail: Optional[str] = None
 
 
-def normalize_slot(slot: Dict[str, Any], index: int) -> Dict[str, Any]:
-    start = float(slot.get("start", slot.get("start_time", slot.get("slot_start", 0))))
+def normalize_slot(slot: Dict[str, Any], index: int, timeline_cursor: float = 0.0) -> Dict[str, Any]:
+    """槽位在模板源视频中的起止（用于 clip_start / 缩略图 seek）。"""
+    source_start = float(slot.get("start", slot.get("start_time", 0)))
 
     if "end" in slot:
-        end = float(slot["end"])
+        source_end = float(slot["end"])
     elif "end_time" in slot:
-        end = float(slot["end_time"])
-    elif slot.get("slot_end") is not None:
-        end = float(slot["slot_end"])
+        source_end = float(slot["end_time"])
     else:
-        end = start + float(slot.get("duration", slot.get("slot_duration", 2)))
+        source_end = source_start + float(slot.get("duration", slot.get("slot_duration", 2)))
 
-    duration = max(0.1, end - start)
+    duration = max(0.1, source_end - source_start)
+    timeline_start = float(timeline_cursor)
+    timeline_end = timeline_start + duration
 
     slot_id = slot.get("slot_id") or slot.get("id") or f"slot_{index + 1:03d}"
+    clip_start = slot.get("clip_start")
+    if clip_start is None:
+        clip_start = source_start
 
     return {
         "slot_id": slot_id,
         "slot_index": index,
-        "slot_start": start,
-        "slot_end": end,
+        "slot_start": timeline_start,
+        "slot_end": timeline_end,
         "slot_duration": duration,
         "template_thumbnail": slot.get("thumbnail", slot.get("thumb", slot.get("template_thumbnail", ""))),
         "shot_type": slot.get("shot_type", ""),
         "scene_tags": slot.get("tags", slot.get("scene_tags", [])),
         "ai_description": slot.get("ai_description", ""),
         "ai_tags": slot.get("ai_tags", []),
+        "ai_replace_hint": slot.get("ai_replace_hint", ""),
+        "ai_subject": slot.get("ai_subject", ""),
         "subtitle_text": slot.get("subtitle_text", ""),
         "subtitle_segments": slot.get("subtitle_segments", []),
         "asset_id": slot.get("asset_id"),
         "asset_file_path": slot.get("asset_file_path", ""),
         "asset_thumbnail": slot.get("asset_thumbnail", ""),
         "asset_filename": slot.get("asset_filename", ""),
-        "clip_start": float(slot.get("clip_start", slot.get("start", 0))),
+        "clip_start": float(clip_start),
         "clip_duration": slot.get("clip_duration", duration),
         "use_original_audio": slot.get("use_original_audio", False),
         "asset_audio_volume": slot.get("asset_audio_volume", 0.3),
@@ -85,10 +91,13 @@ def normalize_slot(slot: Dict[str, Any], index: int) -> Dict[str, Any]:
 def build_initial_timeline_from_template(template: Template):
     slots = template.slots or []
     timeline = []
+    cursor = 0.0
 
     for index, slot in enumerate(slots):
         if isinstance(slot, dict):
-            timeline.append(normalize_slot(slot, index))
+            entry = normalize_slot(slot, index, timeline_cursor=cursor)
+            timeline.append(entry)
+            cursor = float(entry["slot_end"])
 
     return timeline
 
@@ -341,6 +350,7 @@ def get_project(project_id: str, db: Session = Depends(get_db)):
             "processing_status": getattr(template, "processing_status", "ready"),
             "processing_progress": getattr(template, "processing_progress", 100),
             "beat_markers": getattr(template, "beat_markers", []) or [],
+            "sfx_markers": getattr(template, "sfx_markers", []) or [],
             "proxy_paths": normalize_proxy_paths(getattr(template, "proxy_paths", None)),
         }
 

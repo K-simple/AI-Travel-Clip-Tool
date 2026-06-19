@@ -262,12 +262,99 @@ def capcut_mate_status():
         "detected_lan_host": detect_lan_host(),
         "api_key_required_for_storage": bool(os.getenv("API_KEY", "").strip()),
         "hint": (
-            "1) 启动剪映小助手 CapCut Mate（默认 http://localhost:30000）；"
+            "1) 启动剪映小助手 CapCut Mate（默认 http://127.0.0.1:30000）；"
             "2) 安装剪映 PC 版；"
-            "3) 导出后点击 draft_url 打开草稿（勿手动新建空白项目）；"
+            "3) 导出后点击「在剪映中打开草稿」安装到剪映目录（勿手动新建空白项目）；"
             "4) 若素材拉取失败，在 backend/.env 设置 PUBLIC_MEDIA_BASE_URL"
         ),
     }
+
+
+class CapCutInstallDraftRequest(BaseModel):
+    draft_url: str
+
+
+@router.post("/capcut-install-draft")
+def install_capcut_draft(body: CapCutInstallDraftRequest):
+    """将已导出的 CapCut Mate 草稿复制到剪映 PC 草稿目录。"""
+    from utils.jianying_draft import install_capcut_draft_to_jianying
+
+    draft_url = (body.draft_url or "").strip()
+    if not draft_url:
+        raise HTTPException(status_code=400, detail="缺少 draft_url")
+    try:
+        return install_capcut_draft_to_jianying(draft_url)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/capcut-draft-async")
+def export_capcut_draft_async(body: CapCutDraftRequest, db: Session = Depends(get_db)):
+    """异步导出剪映草稿，前端轮询 /tasks/{task_id} 获取进度。"""
+    if not capcut_mate_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail="未配置 CAPCUT_MATE_BASE_URL，无法导出剪映草稿",
+        )
+    if not capcut_ping():
+        raise HTTPException(
+            status_code=503,
+            detail=f"无法连接剪映小助手（{CAPCUT_MATE_BASE_URL}），请先启动 CapCut Mate",
+        )
+
+    template, project_timeline, project = _resolve_export_context(
+        db, body.project_id, body.template_id, body.timeline
+    )
+
+    if template.processing_status == "processing":
+        raise HTTPException(status_code=409, detail="模板仍在后台处理中")
+
+    from utils.public_media import resolve_public_media_base
+
+    media_base = resolve_public_media_base(body.media_base_url)
+
+    track_controls = body.track_controls
+    if track_controls is None and project is not None:
+        track_controls = getattr(project, "track_controls_json", None) or {}
+
+    task_id = create_task(
+        "capcut_draft",
+        {
+            "project_id": body.project_id,
+            "capcut_export_mode": body.capcut_export_mode,
+        },
+    )
+
+    def _job():
+        result = export_timeline_to_capcut_draft(
+            timeline=project_timeline,
+            template=template,
+            resolution=body.resolution,
+            media_base_url=media_base,
+            template_music_enabled=body.template_music_enabled,
+            use_asset_audio=body.use_asset_audio,
+            asset_audio_volume=body.asset_audio_volume,
+            template_audio_volume=body.template_audio_volume,
+            add_subtitles=body.add_subtitles,
+            track_controls=track_controls,
+            include_template_slots=body.include_template_slots,
+            capcut_export_mode=body.capcut_export_mode,
+            task_id=task_id,
+        )
+        project_name = getattr(project, "name", "") if project else ""
+        return {
+            "success": True,
+            **result,
+            "project_name": project_name,
+            "message": (
+                f"已生成 {result.get('clips_count', 0)} 个片段的剪映草稿"
+                + (f"（{project_name}）" if project_name else "")
+                + "，请点击 draft_url 在剪映中打开"
+            ),
+        }
+
+    run_task(task_id, _job)
+    return {"success": True, "task_id": task_id}
 
 
 @router.post("/capcut-draft")

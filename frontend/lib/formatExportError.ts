@@ -16,7 +16,11 @@ const ERROR_PATTERNS: Array<{ test: RegExp; message: string }> = [
     message: '视频编码失败，可能是显卡驱动或 ffmpeg 配置问题，请稍后重试或联系管理员',
   },
   {
-    test: /timeout|超时/i,
+    test: /not found/i,
+    message: '后端接口未就绪，请重启 backend 服务后重试',
+  },
+  {
+    test: /timed out|timeout|超时/i,
     message: '导出耗时过长已超时，可尝试减少槽位数量或降低分辨率后重试',
   },
   {
@@ -32,8 +36,23 @@ const ERROR_PATTERNS: Array<{ test: RegExp; message: string }> = [
     message: '视频合成失败，可能是某个素材文件损坏或路径无效',
   },
   {
-    test: /CapCut|剪映小助手|CAPCUT_MATE/i,
-    message: '剪映小助手未连接，请先启动 CapCut Mate（默认端口 30000）',
+    test: /无法连接剪映小助手|请先启动 CapCut Mate|Connection refused|ECONNREFUSED/i,
+    message:
+      '剪映小助手未连接，请先运行 scripts/start-capcut-mate.ps1 启动服务（默认 http://127.0.0.1:30000）',
+  },
+  {
+    test: /无法访问素材 URL|CapCut Mate 无法访问素材/i,
+    message:
+      '剪映小助手无法下载素材，请确认 backend 在 http://127.0.0.1:8000 运行，且 backend/.env 中 PUBLIC_MEDIA_BASE_URL=http://127.0.0.1:8000',
+  },
+  {
+    test: /video_url must start with http|参数校验失败.*video_infos|素材 URL 格式无效|素材 URL 为空/i,
+    message:
+      '素材 URL 格式无效，请刷新页面后重试；若仍失败，确认 backend/.env 已设置 PUBLIC_MEDIA_BASE_URL=http://127.0.0.1:8000 并重启 backend',
+  },
+  {
+    test: /草稿创建失败|未返回 draft_url|DRAFT_CREATE/i,
+    message: '剪映草稿创建失败，请重启 CapCut Mate 后重试（查看 capcut-mate/logs 日志）',
   },
 ];
 

@@ -11,11 +11,15 @@ from sqlalchemy.orm import Session
 from models.database import SessionLocal, Template, get_db
 from services.audio_processor import extract_template_audio_clean
 from services.proxy_generator import normalize_proxy_paths
+from services.subtitle_gen import normalize_chinese_subtitle
+from services.slot_subtitle import extract_subtitles_for_slot_range, slot_dict_source_range
 from services.task_queue import create_task, run_task
 from services.template_processor import (
     mark_template_failed,
     process_template_full as run_template_full,
 )
+from services.vocal_separator import ensure_vocal_and_bgm_tracks
+from utils.security import resolve_storage_path
 from utils.upload_stream import save_upload_stream
 
 
@@ -155,22 +159,19 @@ def extract_template_audio(video_path: str, output_path: str):
 
 def extract_audio_for_whisper(video_path: str, output_path: str):
     """
-    提取给 Whisper 使用的音频，只用于字幕识别。
+    提取给 Whisper 使用的音频：先分离人声与 BGM，再输出 16k 人声音轨。
     """
     if not has_audio_stream(video_path):
         raise RuntimeError("模板视频没有音频轨，无法识别字幕")
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", video_path,
-        "-vn",
-        "-ac", "1",
-        "-ar", "16000",
-        "-c:a", "pcm_s16le",
-        output_path
-    ]
+    template_dir = os.path.dirname(resolve_storage_path(video_path))
+    tracks = ensure_vocal_and_bgm_tracks(video_path, template_dir)
+    whisper_src = tracks.get("whisper") or tracks.get("vocals")
+    if not whisper_src or not file_ok(whisper_src):
+        raise RuntimeError("人声轨生成失败")
 
-    run_cmd(cmd)
+    if os.path.abspath(whisper_src) != os.path.abspath(output_path):
+        shutil.copy2(whisper_src, output_path)
 
     if not file_ok(output_path):
         raise RuntimeError("Whisper 音频提取失败")
@@ -192,11 +193,11 @@ def normalize_segments(raw_segments: Any) -> List[Dict[str, Any]]:
         if isinstance(seg, dict):
             start = float(seg.get("start", 0))
             end = float(seg.get("end", 0))
-            text = str(seg.get("text", "")).strip()
+            text = normalize_chinese_subtitle(str(seg.get("text", "")).strip())
         else:
             start = float(getattr(seg, "start", 0))
             end = float(getattr(seg, "end", 0))
-            text = str(getattr(seg, "text", "")).strip()
+            text = normalize_chinese_subtitle(str(getattr(seg, "text", "")).strip())
 
         if not text:
             continue
@@ -318,32 +319,10 @@ def attach_subtitles_to_slots(
 
     for slot in slots:
         item = dict(slot)
-
-        slot_start = float(item.get("start", item.get("start_time", 0)))
-
-        if "end" in item:
-            slot_end = float(item["end"])
-        elif "end_time" in item:
-            slot_end = float(item["end_time"])
-        else:
-            slot_end = slot_start + float(item.get("duration", 0))
-
-        texts = []
-        related_segments = []
-
-        for seg in subtitle_segments:
-            seg_start = float(seg["start"])
-            seg_end = float(seg["end"])
-
-            overlap = max(slot_start, seg_start) < min(slot_end, seg_end)
-
-            if overlap:
-                texts.append(seg["text"])
-                related_segments.append(seg)
-
-        item["subtitle_text"] = " ".join(texts).strip()
+        slot_start, slot_end = slot_dict_source_range(item)
+        related_segments = extract_subtitles_for_slot_range(subtitle_segments, slot_start, slot_end)
+        item["subtitle_text"] = " ".join(seg["text"] for seg in related_segments).strip()
         item["subtitle_segments"] = related_segments
-
         result.append(item)
 
     return result
@@ -580,6 +559,39 @@ def reprocess_template(
     }
 
 
+@router.post("/{template_id}/analyze-media")
+def analyze_template_media(template_id: str, db: Session = Depends(get_db)):
+    """对已有模板重新运行字幕花字样式 + 音效点位分析（不重新切分镜头）。"""
+    from services.template_processor import _apply_media_enrichment
+
+    template = db.query(Template).filter(Template.id == template_id).first()
+    if not template:
+        raise HTTPException(status_code=404, detail="模板不存在")
+    if not template.file_path or not os.path.isfile(template.file_path):
+        raise HTTPException(status_code=400, detail="模板视频文件不存在")
+
+    template_dir = os.path.dirname(template.file_path)
+    try:
+        _apply_media_enrichment(
+            template_id,
+            template.file_path,
+            template_dir,
+            include_subtitle_styles=True,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"媒体分析失败: {exc}") from exc
+
+    db.refresh(template)
+    return {
+        "success": True,
+        "template_id": template_id,
+        "beat_markers": getattr(template, "beat_markers", []) or [],
+        "sfx_markers": getattr(template, "sfx_markers", []) or [],
+        "segments_json": getattr(template, "segments_json", []) or [],
+        "slots": template.slots,
+    }
+
+
 @router.get("/{template_id}/status")
 def get_template_status(template_id: str, db: Session = Depends(get_db)):
     template = db.query(Template).filter(Template.id == template_id).first()
@@ -595,7 +607,13 @@ def get_template_status(template_id: str, db: Session = Depends(get_db)):
         "audio_ready": bool(getattr(template, "audio_path", "")),
         "subtitle_ready": bool(getattr(template, "subtitle_srt_path", "")),
         "beat_markers": getattr(template, "beat_markers", []) or [],
+        "sfx_markers": getattr(template, "sfx_markers", []) or [],
+        "segments_json": getattr(template, "segments_json", []) or [],
         "slot_count": getattr(template, "slot_count", 0) or len(template.slots or []),
+        "slots_ai_ready_count": sum(
+            1 for s in (template.slots or []) if isinstance(s, dict) and s.get("ai_description")
+        ),
+        "ai_vision": getattr(template, "ai_vision_json", None) or {},
         "duration": template.duration,
         "proxy_paths": normalize_proxy_paths(getattr(template, "proxy_paths", None)),
         "editable": getattr(template, "processing_status", "ready") == "ready"
@@ -675,5 +693,7 @@ def get_template(template_id: str, db: Session = Depends(get_db)):
         "subtitle_ass_path": getattr(t, "subtitle_ass_path", ""),
         "subtitle_style": getattr(t, "subtitle_style", ""),
         "segments_json": getattr(t, "segments_json", []),
+        "sfx_markers": getattr(t, "sfx_markers", []) or [],
         "proxy_paths": normalize_proxy_paths(getattr(t, "proxy_paths", None)),
+        "ai_vision": getattr(t, "ai_vision_json", None) or {},
     }

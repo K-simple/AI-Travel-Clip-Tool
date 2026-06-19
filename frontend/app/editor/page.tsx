@@ -1,13 +1,20 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent } from 'react';
 import AssetLibrary from '@/components/AssetLibrary';
 import Timeline from '@/components/Timeline';
+import { PanelSplitter } from '@/components/editor/PanelSplitter';
+import { useEditorPanelSizes } from '@/components/editor/useEditorPanelSizes';
 import PreviewPanel from '@/components/PreviewPanel';
 import PropertiesPanel, { type MatchWeights } from '@/components/PropertiesPanel';
 import Toolbar from '@/components/Toolbar';
-import { apiHeaders, apiUrl, toMediaUrl } from '@/lib/api';
-import { getSlotTimeRange, splitSlotAtTime } from '@/lib/slotEdit';
+import { apiHeaders, apiUrl, formatApiDetail, longRunningApiUrl, readApiJson, SUBTITLE_BATCH_CHUNK_SIZE, toMediaUrl } from '@/lib/api';
+import {
+  DEFAULT_ASSET_PANEL_WIDTH,
+  DEFAULT_PLAYER_PANEL_WIDTH,
+  DEFAULT_TIMELINE_PANEL_HEIGHT,
+} from '@/lib/editorLayout';
+import { getSlotSourceTimeRange, getSlotSourceTimeRangeById, splitSlotAtTime, type SfxMarker } from '@/lib/slotEdit';
 import {
   applyAssetToSlot,
   slotsToTimeline,
@@ -30,6 +37,13 @@ import {
   type TrackKey,
   toggleTrackControl,
 } from '@/lib/trackControls';
+import {
+  clampTrackHeight,
+  embedTrackHeights,
+  extractTrackHeights,
+  getDefaultTrackHeight,
+  type TrackHeightMap,
+} from '@/lib/trackHeights';
 import {
   DEFAULT_MATCH_STRATEGY,
   strategyToSettings,
@@ -58,10 +72,13 @@ import {
 import { formatExportError } from '@/lib/formatExportError';
 import { computeOnboardingState, type OnboardingStepId } from '@/lib/onboardingSteps';
 import {
+  exportCapCutDraftSync,
   fetchCapCutStatus,
-  formatCapCutError,
+  fetchCapCutStatusWithRetry,
   guessMediaBaseUrl,
-  openCapCutDraft,
+  installAndOpenCapCutDraft,
+  pollCapCutExportTask,
+  type CapCutExportResult,
   type CapCutMateStatus,
 } from '@/lib/capcutExport';
 
@@ -79,6 +96,7 @@ type VideoSegment = {
 type Asset = {
   id: string;
   title: string;
+  filename?: string;
   duration: string;
   durationSeconds: number;
   tags: string[];
@@ -87,6 +105,7 @@ type Asset = {
   proxyPaths?: PreviewProxyPaths;
   thumbnail?: string;
   segments?: VideoSegment[];
+  segmentCount?: number;
   processingStatus?: 'processing' | 'ready' | 'failed';
   processingProgress?: number;
 };
@@ -139,11 +158,28 @@ export default function EditorPage() {
   const [trackControls, setTrackControls] = useState<Record<TrackKey, TrackControls>>(
     DEFAULT_TRACK_CONTROLS
   );
+  const [trackHeights, setTrackHeights] = useState<TrackHeightMap>({});
+  const workspaceRef = useRef<HTMLDivElement>(null);
+  const timelineDragStartRef = useRef(DEFAULT_TIMELINE_PANEL_HEIGHT);
+  const assetDragStartRef = useRef(DEFAULT_ASSET_PANEL_WIDTH);
+  const playerDragStartRef = useRef(DEFAULT_PLAYER_PANEL_WIDTH);
+  const {
+    timelinePanelHeight,
+    setTimelinePanelHeight,
+    resetTimelinePanelHeight,
+    assetPanelWidth,
+    setAssetPanelWidth,
+    resetAssetPanelWidth,
+    playerPanelWidth,
+    setPlayerPanelWidth,
+    resetPlayerPanelWidth,
+  } = useEditorPanelSizes();
   const [matchStrategy, setMatchStrategy] = useState<MatchStrategy>(DEFAULT_MATCH_STRATEGY);
   const [templateAudioPath, setTemplateAudioPath] = useState('');
   const [templateVideoPath, setTemplateVideoPath] = useState('');
   const [templateProxyPaths, setTemplateProxyPaths] = useState<PreviewProxyPaths>({});
   const [beatMarkers, setBeatMarkers] = useState<number[]>([]);
+  const [sfxMarkers, setSfxMarkers] = useState<SfxMarker[]>([]);
   const templateProcessing = useTemplateProcessing(templateId);
   const lastTemplateSlotCountRef = useRef(0);
   const templateStuckPollsRef = useRef(0);
@@ -152,6 +188,7 @@ export default function EditorPage() {
     at: 0,
   });
   const lastEnhanceStatusRef = useRef<string>('ready');
+  const lastSlotsAiReadyCountRef = useRef(0);
   const [trackControlMessage, setTrackControlMessage] = useState('');
   const trackControlTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [overlayTracks, setOverlayTracks] = useState<OverlayTracks>({ v2: [], v3: [] });
@@ -160,6 +197,7 @@ export default function EditorPage() {
   const [exportProgress, setExportProgress] = useState(0);
   const [capCutDraftUrl, setCapCutDraftUrl] = useState<string | null>(null);
   const [capCutExporting, setCapCutExporting] = useState(false);
+  const [capCutExportProgress, setCapCutExportProgress] = useState(0);
   const [capCutStatus, setCapCutStatus] = useState('');
   const [capCutReplaceableMode, setCapCutReplaceableMode] = useState(false);
   const [capCutMateStatus, setCapCutMateStatus] = useState<CapCutMateStatus | null>(null);
@@ -174,15 +212,31 @@ export default function EditorPage() {
     'idle' | 'pending' | 'saving' | 'saved' | 'error'
   >('idle');
 
-  useEffect(() => {
-    void fetchCapCutStatus().then(setCapCutMateStatus);
+  const refreshCapCutMateStatus = useCallback(async () => {
+    const status = await fetchCapCutStatusWithRetry(2, 300);
+    setCapCutMateStatus(status);
+    if (status?.ready) {
+      setCapCutStatus((prev) =>
+        prev.includes('剪映小助手未连接') || prev.includes('剪映小助手未就绪') ? '' : prev
+      );
+    }
+    return status;
   }, []);
+
+  useEffect(() => {
+    void refreshCapCutMateStatus();
+    const timer = setInterval(() => void refreshCapCutMateStatus(), 8000);
+    return () => clearInterval(timer);
+  }, [refreshCapCutMateStatus]);
 
   useEffect(() => {
     if (templateProcessing.beatMarkers.length) {
       setBeatMarkers(templateProcessing.beatMarkers);
     }
-  }, [templateProcessing.beatMarkers]);
+    if (templateProcessing.sfxMarkers.length) {
+      setSfxMarkers(templateProcessing.sfxMarkers);
+    }
+  }, [templateProcessing.beatMarkers, templateProcessing.sfxMarkers]);
 
   useEffect(() => {
     if (templateProcessing.proxyPaths && Object.keys(templateProcessing.proxyPaths).length) {
@@ -311,6 +365,21 @@ export default function EditorPage() {
     refreshProjectTimelineFromTemplate,
   ]);
 
+  useEffect(() => {
+    if (!projectId || !templateId) return;
+    if (templateProcessing.enhanceStatus !== 'processing') return;
+    const count = templateProcessing.slotsAiReadyCount;
+    if (count <= lastSlotsAiReadyCountRef.current) return;
+    lastSlotsAiReadyCountRef.current = count;
+    void refreshProjectTimelineFromTemplate();
+  }, [
+    projectId,
+    templateId,
+    templateProcessing.enhanceStatus,
+    templateProcessing.slotsAiReadyCount,
+    refreshProjectTimelineFromTemplate,
+  ]);
+
   const assetMap = useMemo(
     () => Object.fromEntries(assets.map((asset) => [asset.id, asset])),
     [assets]
@@ -331,14 +400,61 @@ export default function EditorPage() {
     [slots]
   );
 
-  const handlePreviewAsset = (asset: { filePath?: string; thumbnail?: string }) => {
-    const url = asset.filePath || asset.thumbnail || '';
+  const handlePreviewAsset = (asset: {
+    filePath?: string;
+    proxyPath?: string;
+    proxyPaths?: PreviewProxyPaths;
+    thumbnail?: string;
+  }) => {
+    const url =
+      asset.proxyPath ||
+      asset.proxyPaths?.smooth ||
+      asset.proxyPaths?.clear ||
+      asset.filePath ||
+      asset.thumbnail ||
+      '';
     if (!url) {
       alert('该素材没有可预览的文件');
       return;
     }
     window.open(toMediaUrl(url), '_blank');
   };
+
+  const mapAssetFromApi = useCallback((asset: Record<string, unknown>): Asset => {
+    const filePath = (asset.file_path as string) || '';
+    const filename = String(asset.filename || '').trim();
+    const fallbackTitle =
+      filename || filePath.replace(/\\/g, '/').split('/').pop() || '未命名素材';
+    const segments = (asset.segments as VideoSegment[]) || [];
+    return {
+      id: asset.asset_id as string,
+      title: fallbackTitle,
+      filename: filename || fallbackTitle,
+      duration: formatDuration(Number(asset.duration || 0)),
+      durationSeconds: Number(asset.duration || 0),
+      tags: [],
+      filePath,
+      proxyPath: (asset.proxy_path as string) || undefined,
+      proxyPaths: (asset.proxy_paths as PreviewProxyPaths) || undefined,
+      thumbnail: asset.thumbnail as string | undefined,
+      segments,
+      segmentCount: Number(asset.segment_count ?? segments.length ?? 0),
+      processingStatus: (asset.processing_status as Asset['processingStatus']) || 'ready',
+      processingProgress: Number(asset.processing_progress ?? 100),
+    };
+  }, []);
+
+  const loadAssets = useCallback(async () => {
+    try {
+      const resp = await fetch(apiUrl('/api/assets/list'), { headers: apiHeaders() });
+      const data = await resp.json();
+      if (resp.ok) {
+        setAssets((data as Record<string, unknown>[]).map(mapAssetFromApi));
+      }
+    } catch (error) {
+      console.warn('加载素材列表失败', error);
+    }
+  }, [mapAssetFromApi]);
 
   const handleToggleTrackControl = useCallback((key: TrackKey, field: keyof TrackControls) => {
     setTrackControls((prev) => {
@@ -353,10 +469,29 @@ export default function EditorPage() {
     });
   }, []);
 
+  const handleTrackHeightChange = useCallback((key: TrackKey, height: number | null) => {
+    setTrackHeights((prev) => {
+      const next = { ...prev };
+      if (height == null || height === getDefaultTrackHeight(key)) {
+        delete next[key];
+      } else {
+        next[key] = clampTrackHeight(height);
+      }
+      return next;
+    });
+  }, []);
+
   useEffect(() => {
     return () => {
       if (trackControlTimerRef.current) clearTimeout(trackControlTimerRef.current);
     };
+  }, []);
+
+  const showTimelineHint = useCallback((message: string) => {
+    if (!message) return;
+    if (trackControlTimerRef.current) clearTimeout(trackControlTimerRef.current);
+    setTrackControlMessage(message);
+    trackControlTimerRef.current = setTimeout(() => setTrackControlMessage(''), 2800);
   }, []);
 
   const handleClearSlotAsset = (slotId: string) => {
@@ -383,9 +518,10 @@ export default function EditorPage() {
     );
   };
 
-  const handleAssetDragStart = (event: DragEvent<HTMLDivElement>, assetId: string) => {
-    event.dataTransfer.setData('text/plain', assetId);
-    event.dataTransfer.setData('application/x-asset-id', assetId);
+  const handleAssetDragStart = (event: DragEvent<HTMLDivElement>, dragKey: string) => {
+    const baseAssetId = dragKey.includes(':') ? dragKey.split(':', 2)[0] : dragKey;
+    event.dataTransfer.setData('text/plain', dragKey);
+    event.dataTransfer.setData('application/x-asset-id', baseAssetId);
     event.dataTransfer.effectAllowed = 'copy';
   };
 
@@ -412,6 +548,63 @@ export default function EditorPage() {
       v3: prev.v3.filter((clip) => clip.assetId !== assetId),
     }));
   }, [setSlots]);
+
+  const handleDeleteAssets = useCallback(
+    async (assetIds: string[]): Promise<boolean> => {
+      if (!assetIds.length) return false;
+
+      const uploadingIds = assetIds.filter((id) => id.startsWith('uploading-'));
+      const realIds = assetIds.filter((id) => !id.startsWith('uploading-'));
+
+      if (uploadingIds.length) {
+        setAssets((prev) => prev.filter((a) => !uploadingIds.includes(a.id)));
+      }
+      if (!realIds.length) return true;
+
+      const usedIds = realIds.filter(
+        (id) =>
+          slots.some((s) => s.matchedAssetId === id) ||
+          overlayTracks.v2.some((c) => c.assetId === id) ||
+          overlayTracks.v3.some((c) => c.assetId === id)
+      );
+      const msg =
+        usedIds.length > 0
+          ? `选中有 ${usedIds.length} 个素材已用于时间线，删除后相关片段将被清空。确定删除 ${realIds.length} 个素材？`
+          : `确定删除选中的 ${realIds.length} 个素材？`;
+      if (!window.confirm(msg)) return false;
+
+      const results = await Promise.all(
+        realIds.map(async (assetId) => {
+          try {
+            const resp = await fetch(apiUrl(`/api/assets/${assetId}`), {
+              method: 'DELETE',
+              headers: apiHeaders(),
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+              return { assetId, ok: false as const, error: (data.detail as string) || '删除失败' };
+            }
+            return { assetId, ok: true as const };
+          } catch {
+            return { assetId, ok: false as const, error: '网络错误' };
+          }
+        })
+      );
+
+      const succeeded = results.filter((r) => r.ok).map((r) => r.assetId);
+      const failed = results.filter((r) => !r.ok);
+
+      if (succeeded.length) {
+        setAssets((prev) => prev.filter((a) => !succeeded.includes(a.id)));
+        succeeded.forEach((id) => clearAssetFromSlots(id));
+      }
+      if (failed.length) {
+        alert(`有 ${failed.length} 个素材删除失败，请重试`);
+      }
+      return true;
+    },
+    [slots, overlayTracks, clearAssetFromSlots]
+  );
 
   const handleDeleteAsset = useCallback(
     async (assetId: string) => {
@@ -441,7 +634,7 @@ export default function EditorPage() {
         }
         setAssets((prev) => prev.filter((a) => a.id !== assetId));
         clearAssetFromSlots(assetId);
-      } catch (error) {
+    } catch (error) {
         console.warn('删除素材失败', error);
         alert('删除失败，请重试');
       }
@@ -504,8 +697,16 @@ export default function EditorPage() {
   }, []);
 
   const assignAssetToSlot = useCallback(
-    (asset: Asset, slotId: string, segmentId?: string) => {
-      if (isTrackLocked(trackControls, 'video')) return;
+    (asset: Asset, slotId: string, segmentId?: string): boolean => {
+      if (isTrackLocked(trackControls, 'video')) {
+        showTimelineHint('视频轨已锁定，请点击左侧轨道头解锁后再拖入素材');
+        return false;
+      }
+      const targetSlot = slots.find((slot) => slot.id === slotId);
+      if (targetSlot?.locked) {
+        showTimelineHint('该槽位已锁定，请在属性面板取消锁定后再拖入素材');
+        return false;
+      }
       const binding = resolveSegmentBinding(asset, segmentId);
       setSlots((current) =>
         current.map((slot) =>
@@ -513,36 +714,14 @@ export default function EditorPage() {
         )
       );
       setSelectedSlotId(slotId);
+      const slotIndex = slots.findIndex((slot) => slot.id === slotId);
+      showTimelineHint(
+        slotIndex >= 0 ? `已将素材填入槽位 ${slotIndex + 1}` : '已将素材填入时间线'
+      );
+      return true;
     },
-    [trackControls, setSlots, resolveSegmentBinding]
+    [trackControls, slots, setSlots, resolveSegmentBinding, showTimelineHint]
   );
-
-  const loadAssets = useCallback(async () => {
-    try {
-      const resp = await fetch(apiUrl('/api/assets/list'), { headers: apiHeaders() });
-      const data = await resp.json();
-      if (resp.ok) {
-        setAssets(
-          data.map((asset: Record<string, unknown>) => ({
-            id: asset.asset_id as string,
-            title: asset.filename as string,
-            duration: formatDuration(Number(asset.duration || 0)),
-            durationSeconds: Number(asset.duration || 0),
-            tags: [],
-            filePath: (asset.file_path as string) || '',
-            proxyPath: (asset.proxy_path as string) || undefined,
-            proxyPaths: (asset.proxy_paths as PreviewProxyPaths) || undefined,
-            thumbnail: asset.thumbnail as string | undefined,
-            segments: (asset.segments as VideoSegment[]) || [],
-            processingStatus: (asset.processing_status as Asset['processingStatus']) || 'ready',
-            processingProgress: Number(asset.processing_progress ?? 100),
-          }))
-        );
-      }
-    } catch (error) {
-      console.warn('加载素材列表失败', error);
-    }
-  }, []);
 
   const processingAssetIds = useMemo(
     () =>
@@ -565,17 +744,29 @@ export default function EditorPage() {
           state.duration || firstSeg?.duration || a.durationSeconds || 0
         );
         const thumb = state.thumbnail || firstSeg?.thumbnail || a.thumbnail;
-        return {
+        const next: Asset = {
           ...a,
           processingStatus: state.status,
           processingProgress: Math.max(a.processingProgress ?? 0, state.progress),
           segments: state.segments?.length ? state.segments : a.segments,
+          segmentCount: Math.max(
+            a.segmentCount ?? 0,
+            state.segmentCount ?? state.segments?.length ?? 0
+          ),
           durationSeconds: durationSec > 0 ? durationSec : a.durationSeconds,
           duration: durationSec > 0 ? formatDuration(durationSec) : a.duration,
           thumbnail: thumb || a.thumbnail,
           proxyPath: state.proxyPath || a.proxyPath,
           proxyPaths: state.proxyPaths || a.proxyPaths,
         };
+        if (
+          a.thumbnail?.startsWith('blob:') &&
+          state.thumbnail &&
+          !state.thumbnail.startsWith('blob:')
+        ) {
+          URL.revokeObjectURL(a.thumbnail);
+        }
+        return next;
       })
     );
   });
@@ -608,6 +799,9 @@ export default function EditorPage() {
         if (Array.isArray(data.template?.beat_markers)) {
           setBeatMarkers(data.template.beat_markers as number[]);
         }
+        if (Array.isArray(data.template?.sfx_markers)) {
+          setSfxMarkers(data.template.sfx_markers as SfxMarker[]);
+        }
         if (data.match_strategy && typeof data.match_strategy === 'object') {
           setMatchStrategy({ ...DEFAULT_MATCH_STRATEGY, ...(data.match_strategy as MatchStrategy) });
         }
@@ -615,6 +809,7 @@ export default function EditorPage() {
           setTrackControls(
             mergeTrackControls(data.track_controls as Partial<Record<TrackKey, TrackControls>>)
           );
+          setTrackHeights(extractTrackHeights(data.track_controls));
         }
         if (data.edl) {
           setOverlayTracks(parseOverlayTracksFromEdl(data.edl as Record<string, unknown>));
@@ -661,7 +856,7 @@ export default function EditorPage() {
         headers: apiHeaders(),
         body: JSON.stringify({
           timeline: timelinePayload,
-          track_controls: trackControls,
+          track_controls: embedTrackHeights(trackControls, trackHeights),
           match_strategy: matchStrategy,
           overlay_tracks: overlayTracksToPayload(overlayTracks),
           cover_thumbnail: coverThumbnail || undefined,
@@ -709,6 +904,7 @@ export default function EditorPage() {
     slots,
     overlayTracks,
     trackControls,
+    trackHeights,
     matchStrategy,
     matchWeights,
     coverThumbnail,
@@ -788,36 +984,105 @@ export default function EditorPage() {
     try {
       const payload = slots
         .map((slot) => {
-          const range = getSlotTimeRange(slots, slot.id);
-          if (!range) return null;
-          return { slot_id: slot.id, slot_start: range.start, slot_end: range.end };
-        })
-        .filter(Boolean);
-      const resp = await fetch(apiUrl('/api/subtitle/recognize-slot-batch'), {
-        method: 'POST',
-        headers: apiHeaders(),
-        body: JSON.stringify({ template_id: templateId, slots: payload }),
-      });
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(data.detail || '批量识别失败');
-      const resultMap = new Map(
-        (data.results || []).map((r: { slot_id: string; subtitle_text?: string; subtitle_segments?: unknown[] }) => [
-          r.slot_id,
-          r,
-        ])
-      );
-      setSlots((prev) =>
-        prev.map((slot) => {
-          const hit = resultMap.get(slot.id) as { success?: boolean; subtitle_text?: string; subtitle_segments?: unknown[] } | undefined;
-          if (!hit?.success) return slot;
+          const range = getSlotSourceTimeRange(slot);
+          if (!range || range.end <= range.start) return null;
           return {
-            ...slot,
-            subtitleText: hit.subtitle_text || slot.subtitleText,
-            subtitle_segments: hit.subtitle_segments || slot.subtitle_segments,
+            slot_id: String(slot.originalSlotId ?? slot.id),
+            slot_start: range.start,
+            slot_end: range.end,
           };
         })
-      );
-      alert(`批量识别完成：${data.recognized_count}/${data.total_count} 个槽位`);
+        .filter(Boolean) as Array<{ slot_id: string; slot_start: number; slot_end: number }>;
+
+      if (!payload.length) {
+        alert('没有可识别的槽位');
+        return;
+      }
+
+      type BatchResult = {
+        slot_id?: string | number;
+        success?: boolean;
+        subtitle_text?: string;
+        subtitle_segments?: unknown[];
+        error?: string;
+        source?: string;
+      };
+
+      const applyBatchResults = (results: BatchResult[]) => {
+        const resultMap = new Map(results.map((r) => [String(r.slot_id ?? ''), r]));
+        setSlots((prev) =>
+          prev.map((slot) => {
+            const hit =
+              resultMap.get(String(slot.id)) ||
+              resultMap.get(String(slot.originalSlotId ?? ''));
+            if (!hit?.success) return slot;
+            return {
+              ...slot,
+              subtitleText: hit.subtitle_text || slot.subtitleText,
+              subtitle_segments: hit.subtitle_segments || slot.subtitle_segments,
+            };
+          })
+        );
+      };
+
+      const allResults: BatchResult[] = [];
+      for (let i = 0; i < payload.length; i += SUBTITLE_BATCH_CHUNK_SIZE) {
+        const chunk = payload.slice(i, i + SUBTITLE_BATCH_CHUNK_SIZE);
+        let chunkResults: BatchResult[] = [];
+        let lastError: Error | null = null;
+
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          try {
+            const resp = await fetch(longRunningApiUrl('/api/subtitle/recognize-slot-batch'), {
+              method: 'POST',
+              headers: apiHeaders(),
+              body: JSON.stringify({
+                template_id: templateId,
+                slots: chunk,
+                mode: 'auto',
+              }),
+            });
+            const data = await readApiJson(resp);
+            if (!resp.ok) {
+              throw new Error(formatApiDetail(data.detail, '批量识别失败'));
+            }
+            chunkResults = (data.results as BatchResult[] | undefined) || [];
+            lastError = null;
+            break;
+          } catch (err) {
+            lastError = err instanceof Error ? err : new Error('批量识别失败');
+            if (attempt === 0) {
+              await new Promise((resolve) => setTimeout(resolve, 800));
+            }
+          }
+        }
+
+        if (lastError) throw lastError;
+
+        allResults.push(...chunkResults);
+        applyBatchResults(chunkResults);
+      }
+
+      const withText = allResults.filter(
+        (r) => r.success && String(r.subtitle_text || '').trim()
+      ).length;
+      const whisperCount = allResults.filter((r) => r.success && (r as { source?: string }).source === 'whisper').length;
+      const ocrFallback = allResults.filter(
+        (r) => r.success && (r as { source?: string }).source === 'visual_fallback'
+      ).length;
+      const failed = allResults.filter((r) => r.success === false);
+
+      if (withText === 0) {
+        alert('识别完成，但未得到有效字幕。请确认模板含人声或画面烧录字幕。');
+      } else if (failed.length) {
+        alert(
+          `批量识别完成：${withText}/${payload.length} 个槽位有字幕（人声 ${whisperCount}，画面补识别 ${ocrFallback}，${failed.length} 个失败）`
+        );
+      } else {
+        alert(
+          `批量识别完成：${withText}/${payload.length} 个槽位有字幕（人声 ${whisperCount}，画面补识别 ${ocrFallback}）`
+        );
+      }
     } catch (err) {
       alert(err instanceof Error ? err.message : '批量识别失败');
     } finally {
@@ -922,27 +1187,31 @@ export default function EditorPage() {
       const asset: Asset = {
         id: data.asset_id as string,
         title: (data.filename as string) || file.name,
+        filename: (data.filename as string) || file.name,
         duration: formatDuration(Number(data.duration || 0)),
         durationSeconds: Number(data.duration || 0),
-        tags: [],
+            tags: [],
         filePath: (data.file_path as string) || '',
         segments: (data.segments as VideoSegment[]) || [],
         proxyPath: (data.proxy_path as string) || undefined,
         proxyPaths: (data.proxy_paths as PreviewProxyPaths) || undefined,
-        thumbnail: (data.thumbnail as string) || undefined,
+        thumbnail: (data.thumbnail as string) || localPreview,
         processingStatus: data.processing ? 'processing' : 'ready',
-        processingProgress: Number(data.processing_progress ?? 5),
+        processingProgress: Number(data.processing_progress ?? 12),
       };
 
       setAssets((current) => current.map((a) => (a.id === tempId ? asset : a)));
+      if (data.thumbnail) {
+        URL.revokeObjectURL(localPreview);
+      }
       return asset;
     } catch (error) {
       console.warn('素材上传失败', error);
       setAssets((current) => current.filter((a) => a.id !== tempId));
+      URL.revokeObjectURL(localPreview);
       alert(error instanceof Error ? error.message : '素材上传失败，请重试');
       return null;
     } finally {
-      URL.revokeObjectURL(localPreview);
       setUploadingCount((n) => Math.max(0, n - 1));
     }
   }, []);
@@ -984,8 +1253,11 @@ export default function EditorPage() {
       time: number,
       preferredSlotId?: string | null
     ) => {
-      event.preventDefault();
-      if (isTrackLocked(trackControls, 'video')) return;
+    event.preventDefault();
+      if (isTrackLocked(trackControls, 'video')) {
+        showTimelineHint('视频轨已锁定，请点击左侧轨道头解锁后再拖入素材');
+        return;
+      }
 
       const files = getVideoFilesFromDataTransfer(event.dataTransfer);
       if (files.length > 0) {
@@ -994,24 +1266,40 @@ export default function EditorPage() {
           await handleTemplateUpload(file);
           return;
         }
+        showTimelineHint('正在上传素材…');
         const asset = await uploadAssetFile(file);
         if (!asset) return;
         const slotId = resolveDropSlotId(time, preferredSlotId);
-        if (slotId) assignAssetToSlot(asset, slotId);
+        if (!slotId) {
+          showTimelineHint('请将素材拖到视频轨的槽位上');
+          return;
+        }
+        assignAssetToSlot(asset, slotId);
         return;
       }
 
       const dragKey = event.dataTransfer.getData('text/plain');
       if (!dragKey) return;
       const [assetId, segmentId] = dragKey.includes(':') ? dragKey.split(':', 2) : [dragKey, ''];
-      const asset = assetMap[assetId];
-      if (!asset) return;
+      const asset = assetMap[assetId] ?? assets.find((a) => a.id === assetId);
+      if (!asset) {
+        showTimelineHint('素材未找到，请刷新素材库后重试');
+        return;
+      }
+      if (asset.processingStatus === 'failed') {
+        showTimelineHint('该素材分析失败，请删除后重新上传');
+        return;
+      }
       if (slots.length === 0) {
-        alert('请先拖入模板视频，或从顶部「导入模板」创建时间线');
+        showTimelineHint('请先导入模板视频，再将素材拖到下方视频轨');
         return;
       }
       const slotId = resolveDropSlotId(time, preferredSlotId);
-      if (slotId) assignAssetToSlot(asset, slotId, segmentId || undefined);
+      if (!slotId) {
+        showTimelineHint('请将素材拖到视频轨的某个槽位上');
+        return;
+      }
+      assignAssetToSlot(asset, slotId, segmentId || undefined);
     },
     [
       trackControls,
@@ -1020,7 +1308,9 @@ export default function EditorPage() {
       resolveDropSlotId,
       assignAssetToSlot,
       assetMap,
+      assets,
       handleTemplateUpload,
+      showTimelineHint,
     ]
   );
 
@@ -1139,9 +1429,12 @@ export default function EditorPage() {
       alert('请先导入模板并选择槽位');
       return;
     }
-    if (isTrackLocked(trackControls, 'subtitle')) return;
+    if (isTrackLocked(trackControls, 'subtitle')) {
+      alert('字幕轨已锁定，请先解锁后再识别');
+      return;
+    }
 
-    const range = getSlotTimeRange(slots, selectedSlot.id);
+    const range = getSlotSourceTimeRangeById(slots, selectedSlot.id);
     if (!range || range.end <= range.start) {
       alert('无法确定当前槽位的时间范围');
       return;
@@ -1149,28 +1442,33 @@ export default function EditorPage() {
 
     setRecognizingSubtitle(true);
     try {
-      const resp = await fetch(apiUrl('/api/subtitle/recognize-slot'), {
+      const resp = await fetch(longRunningApiUrl('/api/subtitle/recognize-slot'), {
         method: 'POST',
         headers: apiHeaders(),
         body: JSON.stringify({
           template_id: templateId,
           slot_start: range.start,
           slot_end: range.end,
-          slot_id: selectedSlot.originalSlotId,
+          slot_id: String(selectedSlot.originalSlotId ?? selectedSlot.id),
+          force: true,
+          mode: 'auto',
         }),
       });
-      const data = await resp.json();
+      const data = await readApiJson(resp);
       if (!resp.ok || !data.success) {
-        throw new Error(data.detail || '人声识别失败');
+        throw new Error(formatApiDetail(data.detail, '字幕识别失败'));
       }
 
       handleUpdateSlot({
-        subtitleText: data.subtitle_text || '',
-        subtitle_segments: data.subtitle_segments || [],
+        subtitleText: String(data.subtitle_text || ''),
+        subtitle_segments: (data.subtitle_segments as unknown[]) || [],
       });
+      if (!String(data.subtitle_text || '').trim()) {
+        alert('未得到有效字幕，请确认该槽位含人声或画面烧录字幕');
+      }
     } catch (err) {
       console.error(err);
-      alert(err instanceof Error ? err.message : '人声识别失败');
+      alert(err instanceof Error ? err.message : '字幕识别失败');
     } finally {
       setRecognizingSubtitle(false);
     }
@@ -1262,6 +1560,27 @@ export default function EditorPage() {
       });
     },
     [trackControls, setSlots]
+  );
+
+  const handleTemplateLibraryDelete = useCallback(
+    (tid: string) => {
+      if (templateId !== tid) return;
+      setTemplateId(null);
+      setTemplateName('未选择模板');
+      setTemplateVideoPath('');
+      setTemplateAudioPath('');
+      setTemplateProxyPaths({});
+      setBeatMarkers([]);
+      setSfxMarkers([]);
+      replaceSlots([]);
+      resetHistory();
+      setSelectedSlotId('');
+      setProjectId(null);
+      setExportUrl(null);
+      setExportStatus('');
+      setExportError('');
+    },
+    [templateId, replaceSlots, resetHistory]
   );
 
   const handleTemplateLibraryLoad = useCallback(
@@ -1395,23 +1714,28 @@ export default function EditorPage() {
       return;
     }
 
-    const status = await fetchCapCutStatus();
+    const status = await fetchCapCutStatusWithRetry(3, 500);
     setCapCutMateStatus(status);
-    if (status && !status.ready) {
-      setCapCutStatus('剪映小助手未连接，请先启动 CapCut Mate（默认端口 30000）');
+    if (!status?.ready) {
+      setCapCutStatus(
+        '剪映小助手未连接。请先运行 scripts/start-capcut-mate.ps1 启动服务（默认 http://127.0.0.1:30000），然后点「重新检测」'
+      );
       return;
     }
 
     setCapCutExporting(true);
+    setCapCutExportProgress(5);
     setCapCutDraftUrl(null);
     setCapCutStatus(
       capCutReplaceableMode ? '正在生成可替换模板草稿…' : '正在保存并生成剪映草稿…'
     );
 
+    let exportSucceeded = false;
+
     try {
       const saved = await saveProject();
       if (!saved) {
-        setCapCutStatus('保存项目失败');
+        alert('保存项目失败，无法导出剪映草稿');
         return;
       }
 
@@ -1422,52 +1746,90 @@ export default function EditorPage() {
         addSubtitles,
       });
 
-      const resp = await fetch(apiUrl('/api/export/capcut-draft'), {
+      const capCutRequestBody = {
+        project_id: projectId,
+        ...exportPayload,
+        template_music_enabled: templateMusicEnabled,
+        resolution: exportResolution,
+        include_template_slots: true,
+        capcut_export_mode: capCutReplaceableMode ? 'replaceable_template' : 'filled',
+        media_base_url: guessMediaBaseUrl(),
+      };
+
+      const capCutCallbacks = {
+        onProgress: setCapCutExportProgress,
+        onStatus: setCapCutStatus,
+      };
+
+      const runSyncExport = () => exportCapCutDraftSync(capCutRequestBody, capCutCallbacks);
+
+      let result: CapCutExportResult;
+
+      const asyncResp = await fetch(apiUrl('/api/export/capcut-draft-async'), {
         method: 'POST',
         headers: apiHeaders(),
-        body: JSON.stringify({
-          project_id: projectId,
-          ...exportPayload,
-          template_music_enabled: templateMusicEnabled,
-          resolution: exportResolution,
-          include_template_slots: true,
-          capcut_export_mode: capCutReplaceableMode ? 'replaceable_template' : 'filled',
-          media_base_url: guessMediaBaseUrl(),
-        }),
+        body: JSON.stringify(capCutRequestBody),
       });
-      const data = await resp.json();
-      if (!resp.ok || !data.success) {
-        throw new Error(formatCapCutError(data));
+      const asyncData = (await asyncResp.json()) as CapCutExportResult & { task_id?: string };
+      const asyncUnavailable =
+        asyncResp.status === 404 ||
+        String(asyncData.detail || '').toLowerCase().includes('not found');
+
+      if (asyncUnavailable || !asyncResp.ok || !asyncData.task_id) {
+        result = await runSyncExport();
+      } else {
+        setCapCutStatus('导出任务已提交，正在裁剪并写入剪映草稿…');
+        result = await pollCapCutExportTask(asyncData.task_id, runSyncExport, capCutCallbacks);
       }
 
-      const draftUrl = (data.draft_url as string) || null;
+      const draftUrl = (result.draft_url as string) || null;
       setCapCutDraftUrl(draftUrl);
-      const skipped = (data.skipped_slots as string[] | undefined) || [];
-      const warnings = (data.warnings as string[] | undefined) || [];
+      const skipped = (result.skipped_slots as string[] | undefined) || [];
+      const warnings = (result.warnings as string[] | undefined) || [];
       const skipHint = skipped.length ? `（跳过 ${skipped.length} 个槽位）` : '';
       const warnHint = warnings.length ? `；${warnings[0]}` : '';
       const modeHint = capCutReplaceableMode
         ? '。打开后在剪映中选中片段 → 替换素材'
-        : '。正在打开剪映…';
+        : '。正在安装到剪映…';
+      setCapCutExportProgress(100);
+      const captionHint =
+        capCutReplaceableMode && (result.captions_count ?? 0) > 0
+          ? `、${result.captions_count} 条字幕`
+          : !capCutReplaceableMode && (result.captions_count ?? 0) > 0
+            ? `、${result.captions_count} 条字幕`
+            : '';
       setCapCutStatus(
-        `已生成 ${data.clips_count ?? 0} 个片段、${data.captions_count ?? 0} 条标签/字幕${skipHint}${warnHint}${modeHint}`
+        `已生成 ${result.clips_count ?? 0} 个片段${captionHint}${skipHint}${warnHint}${modeHint}`
       );
+      exportSucceeded = true;
+
       if (draftUrl) {
-        openCapCutDraft(draftUrl);
+        void installAndOpenCapCutDraft(draftUrl, setCapCutStatus).catch((err) => {
+          const msg = err instanceof Error ? err.message : '安装剪映草稿失败';
+          setCapCutStatus(msg);
+          alert(msg);
+        });
       }
     } catch (error) {
       const message = formatExportError(error);
       setCapCutStatus(message);
       setCapCutDraftUrl(null);
+      alert(`剪映草稿导出失败\n\n${message}`);
     } finally {
       setCapCutExporting(false);
+      if (!exportSucceeded) {
+        setCapCutExportProgress(0);
+      }
     }
   };
 
   const handleOpenCapCutDraft = useCallback(() => {
-    if (capCutDraftUrl) {
-      openCapCutDraft(capCutDraftUrl);
-    }
+    if (!capCutDraftUrl) return;
+    void installAndOpenCapCutDraft(capCutDraftUrl, setCapCutStatus).catch((err) => {
+      const msg = err instanceof Error ? err.message : '打开剪映草稿失败';
+      setCapCutStatus(msg);
+      alert(msg);
+    });
   }, [capCutDraftUrl]);
 
   const handleExport = async () => {
@@ -1614,10 +1976,21 @@ export default function EditorPage() {
       templateProcessing.status === 'ready' &&
       templateProcessing.enhanceStatus === 'processing'
     ) {
+      const ep = templateProcessing.enhanceProgress;
+      const detail =
+        ep < 35
+          ? 'AI 修正镜头切分边界'
+          : ep < 45
+            ? '生成槽位缩略图'
+            : ep < 65
+              ? `AI 理解模板画面（${templateProcessing.slotsAiReadyCount}/${templateProcessing.slotCount || '?'})`
+              : ep < 82
+                ? '生成预览代理'
+                : '提取模板音频';
       items.push({
         id: 'template-enhance',
-        label: 'AI 镜头修正',
-        detail: '后台优化切分边界、生成缩略图与预览代理',
+        label: 'AI 理解模板',
+        detail,
         progress: templateProcessing.enhanceProgress,
         status: 'processing',
       });
@@ -1655,7 +2028,9 @@ export default function EditorPage() {
       items.push({
         id: 'capcut',
         label: '生成剪映草稿',
-        progress: 50,
+        detail: capCutStatus || '裁剪片段并写入草稿…',
+        progress: capCutExportProgress,
+        indeterminate: capCutExportProgress <= 0,
         status: 'processing',
       });
     }
@@ -1670,6 +2045,8 @@ export default function EditorPage() {
     exporting,
     exportProgress,
     capCutExporting,
+    capCutExportProgress,
+    capCutStatus,
   ]);
 
   const autosaveLabel = useMemo(() => {
@@ -1716,7 +2093,7 @@ export default function EditorPage() {
     coverThumbnail || slots[0]?.template_thumbnail || slots[0]?.asset_thumbnail || '';
 
   return (
-    <div className="flex h-screen flex-col overflow-hidden bg-[#141414]">
+    <div className="editor-shell flex flex-col overflow-hidden bg-editor-bg">
       <ProjectListModal
         open={projectListOpen}
         currentProjectId={projectId}
@@ -1758,157 +2135,238 @@ export default function EditorPage() {
         progressPercent={onboarding.progressPercent}
         allDone={onboarding.allDone}
         onStepAction={handleOnboardingStepAction}
+        exportBusy={
+          capCutExporting
+            ? {
+                label: `剪映导出 ${capCutExportProgress > 0 ? `${capCutExportProgress}%` : '准备中…'}`,
+                progress: capCutExportProgress,
+              }
+            : null
+        }
       />
 
       <GlobalStatusBar items={globalStatusItems} autosaveLabel={autosaveLabel} />
 
-      <div className="flex min-h-0 flex-1">
-        <div className="w-[min(360px,32vw)] shrink-0">
-          <AssetLibrary
-            assets={assets}
-            usedAssetIds={usedAssetIds}
-            loading={loading || uploadingCount > 0}
-            templateId={templateId}
-            onAssetDragStart={handleAssetDragStart}
-            onAssetUpload={handleAssetUpload}
-            onTemplateUpload={handleTemplateUpload}
-            hasTemplate={!!templateId && slots.length > 0}
-            onPreviewAsset={handlePreviewAsset}
-            onTemplateInstalled={(tid) => void handleTemplateInstalled(tid)}
-            onAssetDelete={(id) => void handleDeleteAsset(id)}
-            onAssetsRefresh={() => void loadAssets()}
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden lg:flex-row-reverse">
+        <div
+          className="editor-layout-player flex min-h-[min(36vh,360px)] flex-col overflow-hidden lg:min-h-0 lg:border-l lg:border-editor-border"
+          style={{ '--editor-player-width': `${playerPanelWidth}px` } as CSSProperties}
+        >
+          <PreviewPanel
             slots={slots}
-            selectedSlotId={selectedSlotId}
-            onSelectSlot={handleSlotSelect}
-            onUpdateSlotSubtitle={handleUpdateSlotSubtitle}
-            templateMusicEnabled={templateMusicEnabled}
+            selectedSlot={selectedSlot}
+            playheadTime={playheadTime}
+            isPlaying={isPlaying}
+            onTogglePlay={handleTogglePlay}
+            timelineName={projectTitle}
+            trackControls={trackControls}
+            assetMap={assetMap}
             templateAudioUrl={templateAudioPath}
-            onToggleTemplateMusic={handleToggleTemplateMusic}
-            onToggleSlotOriginalAudio={handleToggleSlotOriginalAudio}
-            onBatchRecognizeSubtitles={() => void handleBatchRecognizeSubtitles()}
-            recognizingAllSubtitles={recognizingAllSubtitles}
-            onTemplateLibrarySelect={(tid) => void handleTemplateLibraryLoad(tid)}
-            onTemplateLibraryImported={(tid) => void handleTemplateLibraryLoad(tid)}
+            templateVideoPath={templateVideoPath}
+            templateProxyPaths={templateProxyPaths}
+            templateMusicEnabled={templateMusicEnabled}
+            processingProgress={templateProcessing.progress}
+            processingStatus={templateProcessing.status}
+            exportUrl={exportUrl}
+            exportStatus={exportStatus}
+            exportError={exportError}
+            exportResolution={exportResolution}
+            onExportResolutionChange={setExportResolution}
+            addSubtitles={addSubtitles}
+            onAddSubtitlesChange={setAddSubtitles}
+            exportProgress={exportProgress}
+            exporting={exporting}
+            onExport={handleExport}
+            onExportCapCut={handleExportCapCut}
+            capCutDraftUrl={capCutDraftUrl}
+            capCutExporting={capCutExporting}
+            capCutExportProgress={capCutExportProgress}
+            capCutStatus={capCutStatus}
+            capCutReplaceableMode={capCutReplaceableMode}
+            onCapCutReplaceableModeChange={setCapCutReplaceableMode}
+            capCutMateStatus={capCutMateStatus}
+            onRefreshCapCutMate={() => void refreshCapCutMateStatus()}
+            onOpenCapCutDraft={handleOpenCapCutDraft}
+            canExport={canExport}
+            onPlayheadChange={handlePlayheadChange}
+            onPlayheadStep={handlePlayheadStep}
           />
         </div>
 
+        <PanelSplitter
+          orientation="vertical"
+          className="hidden lg:flex"
+          ariaValueNow={playerPanelWidth}
+          title="拖动调整播放器宽度，双击恢复默认"
+          onResizeStart={() => {
+            playerDragStartRef.current = playerPanelWidth;
+          }}
+          onResize={(delta) => setPlayerPanelWidth(playerDragStartRef.current - delta)}
+          onReset={resetPlayerPanelWidth}
+        />
+
+        {/* 左侧工作区：素材 + 草稿参数 + 时间轴（空间不足时优先压缩此处） */}
+        <div
+          ref={workspaceRef}
+          className="editor-layout-workspace flex min-h-0 min-w-0 flex-col overflow-hidden"
+        >
+          <div className="flex min-h-0 flex-1 flex-col overflow-hidden lg:min-h-[200px] lg:flex-row lg:shrink">
+            <div
+              className="editor-layout-asset flex min-h-[min(28vh,240px)] flex-col overflow-hidden border-b border-editor-border lg:min-h-0 lg:border-b-0 lg:border-r"
+              style={{ '--editor-asset-width': `${assetPanelWidth}px` } as CSSProperties}
+            >
+          <AssetLibrary
+            assets={assets}
+            usedAssetIds={usedAssetIds}
+                loading={loading || uploadingCount > 0}
+                templateId={templateId}
+            onAssetDragStart={handleAssetDragStart}
+            onAssetUpload={handleAssetUpload}
+                onTemplateUpload={handleTemplateUpload}
+                hasTemplate={!!templateId && slots.length > 0}
+            onPreviewAsset={handlePreviewAsset}
+                onTemplateInstalled={(tid) => void handleTemplateInstalled(tid)}
+                onAssetDelete={(id) => void handleDeleteAsset(id)}
+                onAssetsDelete={(ids) => handleDeleteAssets(ids)}
+                onAssetsRefresh={() => void loadAssets()}
+                slots={slots}
+                selectedSlotId={selectedSlotId}
+                onSelectSlot={handleSlotSelect}
+                onUpdateSlotSubtitle={handleUpdateSlotSubtitle}
+                templateMusicEnabled={templateMusicEnabled}
+                templateAudioUrl={templateAudioPath}
+                onToggleTemplateMusic={handleToggleTemplateMusic}
+                onToggleSlotOriginalAudio={handleToggleSlotOriginalAudio}
+                onBatchRecognizeSubtitles={() => void handleBatchRecognizeSubtitles()}
+                recognizingAllSubtitles={recognizingAllSubtitles}
+                onRecognizeSlotSubtitle={() => void handleRecognizeSlotSubtitle()}
+                recognizingSlotSubtitle={recognizingSubtitle}
+                onTemplateLibrarySelect={(tid) => void handleTemplateLibraryLoad(tid)}
+                onTemplateLibraryImported={(tid) => void handleTemplateLibraryLoad(tid)}
+                onTemplateLibraryDeleted={handleTemplateLibraryDelete}
+          />
+        </div>
+
+            <PanelSplitter
+              orientation="vertical"
+              className="hidden lg:flex"
+              ariaValueNow={assetPanelWidth}
+              title="拖动调整素材库宽度，双击恢复默认"
+              onResizeStart={() => {
+                assetDragStartRef.current = assetPanelWidth;
+              }}
+              onResize={(delta) => setAssetPanelWidth(assetDragStartRef.current + delta)}
+              onReset={resetAssetPanelWidth}
+            />
+
+            <div className="flex min-h-[min(20vh,180px)] min-w-0 flex-1 shrink flex-col overflow-hidden border-b border-editor-border lg:min-h-0 lg:max-h-full lg:border-b-0">
         <PropertiesPanel
           selectedSlot={selectedSlot}
-          trackControls={trackControls}
-          asset={selectedSlot?.matchedAssetId ? assetMap[selectedSlot.matchedAssetId] : undefined}
-          assetDurationSeconds={
-            selectedSlot?.matchedAssetId
-              ? assetMap[selectedSlot.matchedAssetId]?.durationSeconds
-              : undefined
-          }
-          matchWeights={matchWeights}
-          matchStrategy={matchStrategy}
-          templateName={templateName}
-          slotCount={slots.length}
-          templateMusicEnabled={templateMusicEnabled}
-          matching={matching}
-          matchMessage={matchMessage}
-          matchError={matchError}
-          onMatchWeightsChange={setMatchWeights}
-          onMatchStrategyChange={setMatchStrategy}
+                trackControls={trackControls}
+                asset={selectedSlot?.matchedAssetId ? assetMap[selectedSlot.matchedAssetId] : undefined}
+                assetDurationSeconds={
+                  selectedSlot?.matchedAssetId
+                    ? assetMap[selectedSlot.matchedAssetId]?.durationSeconds
+                    : undefined
+                }
+                matchWeights={matchWeights}
+                matchStrategy={matchStrategy}
+                templateName={templateName}
+                slotCount={slots.length}
+                templateAiVision={templateProcessing.aiVision}
+                sfxMarkers={sfxMarkers}
+                templateMusicEnabled={templateMusicEnabled}
+                matching={matching}
+                matchMessage={matchMessage}
+                matchError={matchError}
+                onMatchWeightsChange={setMatchWeights}
+                onMatchStrategyChange={setMatchStrategy}
           onUpdateSlot={handleUpdateSlot}
-          onDeleteSlot={handleDeleteSlot}
-          onClearAsset={handleClearSlotAsset}
-          onAutoMatch={runAutoMatch}
-          onToggleTemplateMusic={handleToggleTemplateMusic}
-          templateId={templateId}
-          recognizingSubtitle={recognizingSubtitle}
-          onRecognizeSlotSubtitle={handleRecognizeSlotSubtitle}
-          onRecognizeAllSubtitles={handleBatchRecognizeSubtitles}
-          recognizingAllSubtitles={recognizingAllSubtitles}
-          onImportTemplate={triggerTemplateImport}
-          onMoveSlot={handleMoveSlot}
-          slotOrderIndex={selectedSlotOrderIndex}
-          slotOrderTotal={slots.length}
-        />
-
-        <PreviewPanel
-          slots={slots}
-          selectedSlot={selectedSlot}
-          playheadTime={playheadTime}
-          isPlaying={isPlaying}
-          onTogglePlay={handleTogglePlay}
-          timelineName={projectTitle}
-          trackControls={trackControls}
-          assetMap={assetMap}
-          templateAudioUrl={templateAudioPath}
-          templateVideoPath={templateVideoPath}
-          templateProxyPaths={templateProxyPaths}
-          templateMusicEnabled={templateMusicEnabled}
-          processingProgress={templateProcessing.progress}
-          processingStatus={templateProcessing.status}
-          exportUrl={exportUrl}
-          exportStatus={exportStatus}
-          exportError={exportError}
-          exportResolution={exportResolution}
-          onExportResolutionChange={setExportResolution}
-          addSubtitles={addSubtitles}
-          onAddSubtitlesChange={setAddSubtitles}
-          exportProgress={exportProgress}
-          exporting={exporting}
-          onExport={handleExport}
-          onExportCapCut={handleExportCapCut}
-          capCutDraftUrl={capCutDraftUrl}
-          capCutExporting={capCutExporting}
-          capCutStatus={capCutStatus}
-          capCutReplaceableMode={capCutReplaceableMode}
-          onCapCutReplaceableModeChange={setCapCutReplaceableMode}
-          capCutMateStatus={capCutMateStatus}
-          onOpenCapCutDraft={handleOpenCapCutDraft}
-          canExport={canExport}
-          onPlayheadChange={handlePlayheadChange}
-          onPlayheadStep={handlePlayheadStep}
-        />
+                onDeleteSlot={handleDeleteSlot}
+                onClearAsset={handleClearSlotAsset}
+                onAutoMatch={runAutoMatch}
+                onToggleTemplateMusic={handleToggleTemplateMusic}
+                templateId={templateId}
+                recognizingSubtitle={recognizingSubtitle}
+                onRecognizeSlotSubtitle={handleRecognizeSlotSubtitle}
+                onRecognizeAllSubtitles={handleBatchRecognizeSubtitles}
+                recognizingAllSubtitles={recognizingAllSubtitles}
+                onImportTemplate={triggerTemplateImport}
+                onMoveSlot={handleMoveSlot}
+                slotOrderIndex={selectedSlotOrderIndex}
+                slotOrderTotal={slots.length}
+              />
+            </div>
       </div>
 
-      <div className="h-[260px] shrink-0 border-t border-[#242428]">
+          <PanelSplitter
+            orientation="horizontal"
+            ariaValueNow={timelinePanelHeight}
+            title="拖动调整时间轴高度，双击恢复默认"
+            onResizeStart={() => {
+              timelineDragStartRef.current = timelinePanelHeight;
+            }}
+            onResize={(delta) =>
+              setTimelinePanelHeight(
+                timelineDragStartRef.current + delta,
+                workspaceRef.current?.clientHeight
+              )
+            }
+            onReset={() => resetTimelinePanelHeight()}
+          />
+
+          <div
+            className="min-h-0 shrink-0 overflow-hidden bg-editor-bg"
+            style={{ height: timelinePanelHeight }}
+          >
         <Timeline
           slots={slots}
           assetMap={assetMap}
-          templateVideoPath={templateVideoPath}
-          coverThumb={timelineCoverThumb}
-          onCoverClick={() => {
-            const input = document.createElement('input');
-            input.type = 'file';
-            input.accept = 'image/*';
-            input.onchange = () => {
-              const file = input.files?.[0];
-              if (file) void handleCoverUpload(file);
-            };
-            input.click();
-          }}
+              templateVideoPath={templateVideoPath}
+              coverThumb={timelineCoverThumb}
+              onCoverClick={() => {
+                const input = document.createElement('input');
+                input.type = 'file';
+                input.accept = 'image/*';
+                input.onchange = () => {
+                  const file = input.files?.[0];
+                  if (file) void handleCoverUpload(file);
+                };
+                input.click();
+              }}
           selectedSlotId={selectedSlotId}
-          playheadTime={playheadTime}
-          isPlaying={isPlaying}
-          canUndo={canUndo}
-          canRedo={canRedo}
-          trackControls={trackControls}
-          trackControlMessage={trackControlMessage}
-          onTrackControlToggle={handleToggleTrackControl}
-          onPlayheadChange={handlePlayheadChange}
-          onScrubStart={handleScrubStart}
-          onTogglePlay={handleTogglePlay}
-          onUndo={undo}
-          onRedo={redo}
-          onSplit={handleSplitAtPlayhead}
-          onDeleteSlot={handleDeleteSlot}
+              playheadTime={playheadTime}
+              isPlaying={isPlaying}
+              canUndo={canUndo}
+              canRedo={canRedo}
+              trackControls={trackControls}
+              trackControlMessage={trackControlMessage}
+              onTrackControlToggle={handleToggleTrackControl}
+              onPlayheadChange={handlePlayheadChange}
+              onScrubStart={handleScrubStart}
+              onTogglePlay={handleTogglePlay}
+              onUndo={undo}
+              onRedo={redo}
+              onSplit={handleSplitAtPlayhead}
+              onDeleteSlot={handleDeleteSlot}
           onSlotSelect={handleSlotSelect}
-          onTimelineDrop={handleTimelineDrop}
-          onTrimSlot={handleTrimSlot}
-          overlayTracks={overlayTracks}
-          onOverlayDrop={handleOverlayDrop}
-          onOverlayDelete={handleOverlayDelete}
-          beatMarkers={beatMarkers}
-          loading={loading}
-          templateMusicEnabled={templateMusicEnabled}
-          templateId={templateId}
-          onReorderSlots={handleReorderSlots}
-        />
+              onTimelineDrop={handleTimelineDrop}
+              onTimelineDropHint={showTimelineHint}
+              onTrimSlot={handleTrimSlot}
+              overlayTracks={overlayTracks}
+              onOverlayDrop={handleOverlayDrop}
+              onOverlayDelete={handleOverlayDelete}
+              beatMarkers={beatMarkers}
+              sfxMarkers={sfxMarkers}
+              loading={loading}
+              templateMusicEnabled={templateMusicEnabled}
+              templateId={templateId}
+              onReorderSlots={handleReorderSlots}
+              trackHeights={trackHeights}
+              onTrackHeightChange={handleTrackHeightChange}
+            />
+          </div>
+        </div>
       </div>
     </div>
   );

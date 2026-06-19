@@ -22,6 +22,7 @@ from services.scene_detector import (
 )
 from services.proxy_generator import generate_preview_proxies, normalize_proxy_paths
 from services.slot_analyzer import enrich_template_slots
+from services.template_vision_analyzer import analyze_template_overview
 
 
 def mark_template_failed(template_id: str, error: str = "") -> None:
@@ -143,6 +144,63 @@ def process_template_edit_ready(template_id: str, file_path: str) -> list:
     return slots
 
 
+def _apply_media_enrichment(
+    template_id: str,
+    file_path: str,
+    template_dir: str,
+    *,
+    segments_json: list | None = None,
+    include_subtitle_styles: bool = True,
+) -> None:
+    """字幕样式 + 音效点位分析，写回模板记录。"""
+    from services.media_enrichment import enrich_template_media_analysis
+    from services.subtitle_style_analyzer import merge_styles_into_slots
+
+    db = SessionLocal()
+    try:
+        template = db.query(Template).filter(Template.id == template_id).first()
+        if not template:
+            return
+        duration = float(template.duration or 0)
+        audio_path = template.audio_path or os.path.join(template_dir, "template_audio.m4a")
+        working_segments = list(
+            segments_json if segments_json is not None else (template.segments_json or [])
+        )
+        slots = list(template.slots or [])
+    finally:
+        db.close()
+
+    result = enrich_template_media_analysis(
+        video_path=file_path,
+        template_dir=template_dir,
+        segments_json=working_segments if include_subtitle_styles else None,
+        audio_path=audio_path,
+        duration=duration,
+        slots=slots,
+    )
+
+    db = SessionLocal()
+    try:
+        template = db.query(Template).filter(Template.id == template_id).first()
+        if not template:
+            return
+        if result.get("beat_markers"):
+            template.beat_markers = result["beat_markers"]
+        if result.get("sfx_markers") is not None:
+            template.sfx_markers = result["sfx_markers"]
+        if include_subtitle_styles and result.get("segments_json"):
+            template.segments_json = result["segments_json"]
+            if result.get("slots"):
+                template.slots = result["slots"]
+            else:
+                template.slots = merge_styles_into_slots(template.slots or [], result["segments_json"])
+        db.commit()
+    except Exception as exc:
+        print(f"媒体增强写回失败: {exc}")
+    finally:
+        db.close()
+
+
 def process_template_enhancement(
     template_id: str,
     file_path: str,
@@ -154,7 +212,7 @@ def process_template_enhancement(
 ) -> None:
     """
     第二阶段：后台增强（不阻塞编辑）。
-    AI 镜头修正 → 槽位缩略图 → 预览代理 → 节拍 → CLIP 标签 → 音频
+    AI 镜头修正 → 槽位缩略图 → AI 画面理解 → 预览代理 → 节拍 → 音频
     """
     db = SessionLocal()
     try:
@@ -190,9 +248,16 @@ def process_template_enhancement(
         # 2) 槽位缩略图
         slots = _attach_thumbnails(file_path, thumb_dir, slots)
         _update_template(template_id, slots=slots, slot_count=len(slots))
-        _bump_enhance(template_id, 50)
+        _bump_enhance(template_id, 45)
 
-        # 3) 预览代理（后台生成，不阻塞编辑）
+        # 3) AI 理解模板画面（槽位描述 + 成片摘要，优先于代理生成）
+        try:
+            process_template_slot_enrich(template_id, file_path, slots=slots, thumb_dir=thumb_dir)
+        except Exception as exc:
+            print(f"模板 AI 画面理解跳过: {exc}")
+        _bump_enhance(template_id, 65)
+
+        # 4) 预览代理（后台生成，不阻塞编辑）
         proxy_paths: Dict[str, str] = {"clear": "", "smooth": "", "low": ""}
 
         def _on_tier(tier: str, path: str) -> None:
@@ -204,21 +269,9 @@ def process_template_enhancement(
 
         generate_preview_proxies(file_path, template_dir, "template", on_tier_ready=_on_tier)
 
-        _bump_enhance(template_id, 70)
+        _bump_enhance(template_id, 82)
 
-        # 4) 节拍
-        beat_markers = estimate_beat_markers(duration)
-        _update_template(template_id, beat_markers=beat_markers)
-
-        # 5) CLIP / 标签 enrich
-        try:
-            process_template_slot_enrich(template_id, file_path)
-        except Exception as exc:
-            print(f"模板槽位 enrich 跳过: {exc}")
-
-        _bump_enhance(template_id, 85)
-
-        # 6) 音频
+        # 5) 音频（节拍/音效分析依赖音频文件）
         process_template_audio_only(
             template_id,
             file_path,
@@ -227,6 +280,18 @@ def process_template_enhancement(
             has_audio_fn,
             file_ok_fn,
         )
+
+        _bump_enhance(template_id, 90)
+
+        try:
+            _apply_media_enrichment(
+                template_id,
+                file_path,
+                template_dir,
+                include_subtitle_styles=False,
+            )
+        except Exception as exc:
+            print(f"音效/节拍分析跳过: {exc}")
 
         _update_template(
             template_id,
@@ -289,24 +354,83 @@ def process_template_fast_intake(template_id: str, file_path: str) -> None:
     )
 
 
-def process_template_slot_enrich(template_id: str, file_path: str) -> None:
-    """为快速槽位补充 CLIP 标签（基于缩略图，与素材分析对称）。"""
+def process_template_slot_enrich(
+    template_id: str,
+    file_path: str,
+    *,
+    slots: list | None = None,
+    thumb_dir: str = "",
+) -> None:
+    """为模板槽位补充 AI 画面描述与成片级视觉摘要。"""
     db = SessionLocal()
     try:
         template = db.query(Template).filter(Template.id == template_id).first()
-        if not template or not template.slots:
+        if not template:
             return
-        slots = enrich_template_slots(list(template.slots), file_path)
-        template.slots = slots
-        template.slot_count = len(slots)
-        if hasattr(template, "updated_at"):
-            template.updated_at = time.time()
-        db.commit()
-        print(f"模板槽位 CLIP 分析完成: {template_id} -> {len(slots)} 段")
-    except Exception as exc:
-        print(f"模板槽位 CLIP 分析失败（保留原槽位）: {exc}")
+        working_slots = list(slots if slots is not None else (template.slots or []))
+        duration = float(template.duration or 0)
     finally:
         db.close()
+
+    if not working_slots:
+        return
+
+    if not thumb_dir:
+        thumb_dir = os.path.join("storage", "thumbnails", template_id)
+
+    pending_save = [0]
+
+    def _flush_slots(force: bool = False) -> None:
+        if not pending_save[0] and not force:
+            return
+        inner = SessionLocal()
+        try:
+            tpl = inner.query(Template).filter(Template.id == template_id).first()
+            if tpl:
+                tpl.slots = list(working_slots)
+                tpl.slot_count = len(working_slots)
+                if hasattr(tpl, "updated_at"):
+                    tpl.updated_at = time.time()
+                inner.commit()
+            pending_save[0] = 0
+        finally:
+            inner.close()
+
+    def _on_slot_ready(index: int, item: dict) -> None:
+        working_slots[index] = item
+        pending_save[0] += 1
+        if pending_save[0] >= 2:
+            _flush_slots()
+
+    try:
+        enriched = enrich_template_slots(
+            working_slots,
+            file_path,
+            on_slot_ready=_on_slot_ready,
+        )
+        working_slots[:] = enriched
+        _flush_slots(force=True)
+
+        vision = analyze_template_overview(file_path, thumb_dir, duration, working_slots)
+        inner = SessionLocal()
+        try:
+            tpl = inner.query(Template).filter(Template.id == template_id).first()
+            if not tpl:
+                return
+            tpl.slots = working_slots
+            tpl.slot_count = len(working_slots)
+            if vision:
+                tpl.ai_vision_json = vision
+                print(f"模板 AI 视觉摘要: {template_id} -> {vision.get('summary', '')}")
+            if hasattr(tpl, "updated_at"):
+                tpl.updated_at = time.time()
+            inner.commit()
+        finally:
+            inner.close()
+
+        print(f"模板 AI 画面理解完成: {template_id} -> {len(working_slots)} 段")
+    except Exception as exc:
+        print(f"模板 AI 画面理解失败（保留原槽位）: {exc}")
 
 
 def process_template_audio_only(
@@ -433,6 +557,13 @@ def _run_whisper_pipeline(
             segments_json = helpers["normalize_segments_fn"](raw_segments)
 
             if segments_json:
+                from services.subtitle_style_analyzer import analyze_subtitle_styles
+
+                try:
+                    segments_json = analyze_subtitle_styles(file_path, segments_json, template_dir)
+                except Exception as style_exc:
+                    print(f"字幕样式分析跳过: {style_exc}")
+
                 helpers["write_srt_fn"](segments_json, subtitle_srt_path)
                 helpers["write_ass_fn"](segments_json, subtitle_ass_path)
             else:
@@ -455,6 +586,20 @@ def _run_whisper_pipeline(
         template.subtitle_srt_path = subtitle_srt_path if file_ok_fn(subtitle_srt_path) else ""
         template.subtitle_ass_path = subtitle_ass_path if file_ok_fn(subtitle_ass_path) else ""
         template.segments_json = segments_json
+        db.commit()
+
+        try:
+            _apply_media_enrichment(
+                template_id,
+                file_path,
+                template_dir,
+                segments_json=segments_json,
+                include_subtitle_styles=False,
+            )
+            db.refresh(template)
+        except Exception as exc:
+            print(f"音效分析写回跳过: {exc}")
+
         template.processing_status = "ready"
         template.processing_progress = 100
         template.enhance_status = "ready"

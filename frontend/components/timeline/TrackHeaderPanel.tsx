@@ -5,6 +5,8 @@ import { toMediaUrl } from '@/lib/api';
 import type { TrackControls, TrackKey } from '@/lib/trackControls';
 import type { TimelineTrackDef } from '@/lib/timelineTracks';
 import { HEADER_W, RULER_H, TIMELINE_THEME } from './timelineTheme';
+import { TrackResizeHandle } from '@/components/timeline/TrackResizeHandle';
+import type { PointerEvent as ReactPointerEvent } from 'react';
 
 export type TrackMeta = {
   key: TrackKey;
@@ -277,22 +279,27 @@ function TrackHeaderRow({
   selected,
   onSelect,
   onToggle,
+  onResizeStart,
+  onResizeReset,
 }: {
   track: TrackMeta;
   ctrl: TrackControls;
   selected: boolean;
   onSelect: () => void;
   onToggle: (field: keyof TrackControls) => void;
+  onResizeStart?: (event: ReactPointerEvent<HTMLDivElement>) => void;
+  onResizeReset?: () => void;
 }) {
   return (
-    <div
-      className={cn(
-        'relative flex items-center gap-1 border-b pl-1.5 pr-1 transition-colors duration-100',
-        selected ? 'bg-[#222224]' : 'bg-[#1a1a1c]',
-        !ctrl.visible && 'opacity-65'
-      )}
-      style={{ height: track.height, borderColor: TIMELINE_THEME.border }}
-    >
+    <div className="group relative shrink-0" style={{ height: track.height }}>
+      <div
+        className={cn(
+          'relative flex h-full items-center gap-1 border-b pl-1.5 pr-1 transition-colors duration-100',
+          selected ? 'bg-[#222224]' : 'bg-[#1a1a1c]',
+          !ctrl.visible && 'opacity-65'
+        )}
+        style={{ borderColor: TIMELINE_THEME.border }}
+      >
       {selected ? (
         <div className="pointer-events-none absolute inset-y-0 left-0 w-[2px] bg-[#face15]" />
       ) : null}
@@ -333,6 +340,10 @@ function TrackHeaderRow({
           onClick={() => onToggle('solo')}
         />
       </div>
+      </div>
+      {onResizeStart ? (
+        <TrackResizeHandle onResizeStart={onResizeStart} onResizeReset={onResizeReset} />
+      ) : null}
     </div>
   );
 }
@@ -349,6 +360,8 @@ type TrackHeaderPanelProps = {
   addableTracks?: TimelineTrackDef[];
   onAddTrack?: (key: TrackKey) => void;
   onCoverClick?: () => void;
+  onTrackResizeStart?: (key: TrackKey, event: ReactPointerEvent<HTMLDivElement>) => void;
+  onTrackResizeReset?: (key: TrackKey) => void;
 };
 
 function TrackHeaderFooter({
@@ -431,6 +444,8 @@ export function TrackHeaderPanel({
   addableTracks = [],
   onAddTrack,
   onCoverClick,
+  onTrackResizeStart,
+  onTrackResizeReset,
 }: TrackHeaderPanelProps) {
   const headerTracksRef = useRef<HTMLDivElement>(null);
 
@@ -474,6 +489,14 @@ export function TrackHeaderPanel({
                 selected={selectedTrackKey === track.key}
                 onSelect={() => onSelectTrack(track.key)}
                 onToggle={(field) => onTrackControlToggle(track.key, field)}
+                onResizeStart={
+                  onTrackResizeStart
+                    ? (event) => onTrackResizeStart(track.key, event)
+                    : undefined
+                }
+                onResizeReset={
+                  onTrackResizeReset ? () => onTrackResizeReset(track.key) : undefined
+                }
               />
             </div>
           );
