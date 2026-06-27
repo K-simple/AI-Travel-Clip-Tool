@@ -31,3 +31,9 @@ capcut-mate/
 *.log
 .cursor/
 terminals/
+
+# Portable build output (run scripts/build-portable.ps1 locally)
+dist/
+
+# Local uploads scratch
+backend/uploads/
