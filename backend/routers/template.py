@@ -2,16 +2,19 @@ import os
 import time
 import uuid
 import shutil
-import subprocess
 from typing import Any, Dict, List
 
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException
+from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Body
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from models.database import SessionLocal, Template, get_db
 from services.audio_processor import extract_template_audio_clean
+from services.media_probe import has_audio_stream
 from services.proxy_generator import normalize_proxy_paths
 from services.subtitle_gen import normalize_chinese_subtitle
+from services.subtitle_render import normalize_segments, write_ass, write_srt
 from services.slot_subtitle import extract_subtitles_for_slot_range, slot_dict_source_range
 from services.task_queue import create_task, run_task
 from services.template_processor import (
@@ -26,14 +29,221 @@ from utils.upload_stream import save_upload_stream
 router = APIRouter()
 
 
+def _template_tts_payload(template: Template) -> dict[str, Any]:
+    from services.tts.tts_pipeline import build_pipeline_debug, get_timeline_timing_mode
+
+    clips = getattr(template, "subtitle_clips_json", []) or []
+    tts_segments = getattr(template, "tts_segments_json", []) or []
+    slots = getattr(template, "slots", []) or []
+    voice_id = getattr(template, "voice_id", "") or ""
+    timing_mode = getattr(template, "timeline_timing_mode", "") or get_timeline_timing_mode()
+    pipeline_stage = getattr(template, "pipeline_stage", "") or ""
+    pipeline_debug = build_pipeline_debug(
+        clips=clips,
+        tts_segments=tts_segments,
+        slots=slots,
+        pipeline_stage=pipeline_stage or None,
+        voice_id=voice_id or None,
+        timing_mode=timing_mode,
+    )
+    return {
+        "tts_segments_json": tts_segments,
+        "ttsSegments": tts_segments,
+        "voiceId": voice_id,
+        "voice_id": voice_id,
+        "timelineTimingMode": timing_mode,
+        "timeline_timing_mode": timing_mode,
+        "pipelineStage": pipeline_debug.get("pipelineStage"),
+        "pipelineDebug": pipeline_debug,
+    }
+
+
+class GenerateTtsRequest(BaseModel):
+    voice_id: str = Field(default="real_blog_female", alias="voiceId")
+    clip_ids: list[str] = Field(default_factory=list, alias="clipIds")
+    overwrite: bool = False
+
+    model_config = {"populate_by_name": True}
+
+
+class AiSplitByCaptionsRequest(BaseModel):
+    source: str = "caption_clips"
+    overwrite_slots: bool = Field(default=True, alias="overwriteSlots")
+    use_tts_aligned_time: bool = Field(default=True, alias="useTtsAlignedTime")
+    merge_short_fragments: bool = Field(default=True, alias="mergeShortFragments")
+    subtitle_clips: list[dict] | None = Field(default=None, alias="subtitleClips")
+
+    model_config = {"populate_by_name": True}
+
+
+class AiSplitByVisualRequest(BaseModel):
+    overwrite_slots: bool = Field(default=True, alias="overwriteSlots")
+    skip_ai_refine: bool = Field(default=False, alias="skipAiRefine")
+    subtitle_clips: list[dict] | None = Field(default=None, alias="subtitleClips")
+
+    model_config = {"populate_by_name": True}
+
+
+def _run_ai_split_template(template: Template, req: AiSplitByCaptionsRequest, db: Session) -> dict:
+    from services.caption_clip_quality import attach_quality_to_clips
+    from services.caption_slot_builder import ai_split_by_captions
+    from services.slot_helpers import slots_will_be_overwritten_by_ai_split
+    from services.tts.tts_pipeline import build_pipeline_debug, get_timeline_timing_mode
+
+    clips = req.subtitle_clips if req.subtitle_clips is not None else (template.subtitle_clips_json or [])
+    clips = attach_quality_to_clips(list(clips or []))
+    if not clips:
+        raise HTTPException(status_code=400, detail="请先识别字幕")
+
+    resolved_path = resolve_storage_path(template.file_path or "") or template.file_path or ""
+    if not resolved_path or not os.path.isfile(resolved_path):
+        raise HTTPException(status_code=400, detail="模板视频不存在")
+
+    existing_slots = list(template.slots or [])
+    if slots_will_be_overwritten_by_ai_split(existing_slots) and not req.overwrite_slots:
+        raise HTTPException(status_code=409, detail="AI 一键分割画面会覆盖当前画面槽，请确认后重试")
+
+    vision = getattr(template, "ai_vision_json", None) or {}
+    visual_suggestions = vision.get("visualCutSuggestions") if isinstance(vision, dict) else None
+
+    tts_segments = getattr(template, "tts_segments_json", []) or []
+    timing_mode = getattr(template, "timeline_timing_mode", "") or None
+
+    try:
+        applied = ai_split_by_captions(
+            template.id,
+            resolved_path,
+            clips,
+            duration=float(getattr(template, "duration", 0) or 0),
+            tts_segments=tts_segments,
+            timing_mode=timing_mode,
+            merge_short_fragments=req.merge_short_fragments,
+            use_tts_aligned_time=req.use_tts_aligned_time,
+            existing_slots=existing_slots,
+            overwrite_slots=req.overwrite_slots,
+            visual_suggestions=visual_suggestions,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    slots = applied.get("slots") or []
+    template.slots = slots
+    template.slot_count = len(slots)
+    template.subtitle_clips_json = applied.get("sentence_clips") or clips
+    template.pipeline_stage = "slots_applied"
+    flag_modified(template, "slots")
+    flag_modified(template, "subtitle_clips_json")
+    db.commit()
+    db.refresh(template)
+
+    pipeline_debug = build_pipeline_debug(
+        clips=template.subtitle_clips_json,
+        tts_segments=tts_segments,
+        slots=slots,
+        pipeline_stage="slots_applied",
+        voice_id=getattr(template, "voice_id", "") or "",
+        timing_mode=timing_mode or get_timeline_timing_mode(),
+    )
+
+    return {
+        "success": True,
+        "slotCount": len(slots),
+        "subtitleClipCount": len(clips),
+        "slots": slots,
+        "subtitleClips": template.subtitle_clips_json,
+        "aiSplitDebug": applied.get("ai_split_debug") or {},
+        "oneCaptionOneShotDebug": applied.get("oneCaptionOneShotDebug") or {},
+        "overwriteWarning": applied.get("overwrite_warning"),
+        "reviewWarning": applied.get("review_warning"),
+        "ttsWarning": applied.get("tts_warning"),
+        "pipelineDebug": pipeline_debug,
+        "summary": applied.get("summary") or {},
+    }
+
+
+def _run_visual_split_template(template: Template, req: AiSplitByVisualRequest, db: Session) -> dict:
+    from services.caption_clip_quality import attach_quality_to_clips
+    from services.caption_slot_builder import ai_split_by_visual_scenes
+    from services.slot_helpers import slots_will_be_overwritten_by_ai_split
+    from services.tts.tts_pipeline import build_pipeline_debug, get_timeline_timing_mode
+
+    clips = req.subtitle_clips if req.subtitle_clips is not None else (template.subtitle_clips_json or [])
+    clips = attach_quality_to_clips(list(clips or []))
+
+    resolved_path = resolve_storage_path(template.file_path or "") or template.file_path or ""
+    if not resolved_path or not os.path.isfile(resolved_path):
+        raise HTTPException(status_code=400, detail="模板视频不存在")
+
+    existing_slots = list(template.slots or [])
+    if slots_will_be_overwritten_by_ai_split(existing_slots) and not req.overwrite_slots:
+        raise HTTPException(status_code=409, detail="按画面切分会覆盖当前画面槽，请确认后重试")
+
+    tts_segments = getattr(template, "tts_segments_json", []) or []
+    timing_mode = getattr(template, "timeline_timing_mode", "") or None
+
+    try:
+        applied = ai_split_by_visual_scenes(
+            template.id,
+            resolved_path,
+            clips,
+            duration=float(getattr(template, "duration", 0) or 0),
+            existing_slots=existing_slots,
+            overwrite_slots=req.overwrite_slots,
+            skip_ai_refine=req.skip_ai_refine,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    slots = applied.get("slots") or []
+    template.slots = slots
+    template.slot_count = len(slots)
+    if applied.get("sentence_clips"):
+        template.subtitle_clips_json = applied["sentence_clips"]
+    template.pipeline_stage = "slots_applied"
+    flag_modified(template, "slots")
+    flag_modified(template, "subtitle_clips_json")
+    db.commit()
+    db.refresh(template)
+
+    pipeline_debug = build_pipeline_debug(
+        clips=template.subtitle_clips_json,
+        tts_segments=tts_segments,
+        slots=slots,
+        pipeline_stage="slots_applied",
+        voice_id=getattr(template, "voice_id", "") or "",
+        timing_mode=timing_mode or get_timeline_timing_mode(),
+    )
+
+    return {
+        "success": True,
+        "slotCount": len(slots),
+        "subtitleClipCount": len(clips),
+        "slots": slots,
+        "subtitleClips": template.subtitle_clips_json,
+        "aiSplitDebug": applied.get("ai_split_debug") or {},
+        "visualSplitDebug": applied.get("ai_split_debug") or {},
+        "overwriteWarning": applied.get("overwrite_warning"),
+        "pipelineDebug": pipeline_debug,
+        "summary": applied.get("summary") or {},
+        "splitStrategy": "visual_scene_split",
+    }
+
+
 def build_quick_template_slots(duration: float = 0) -> List[Dict[str, Any]]:
     slot_duration = round(duration, 3) if duration > 0 else 3.0
     return [
         {
+            "id": "slot_base_001",
             "slot_id": 1,
             "start": 0.0,
             "end": slot_duration,
             "duration": slot_duration,
+            "clip_start": 0.0,
+            "clip_end": slot_duration,
+            "source": "base",
+            "cut_reason": "full_video",
+            "isBaseSlot": True,
+            "subtitle_text": "",
             "thumbnail": "",
             "tags": [],
             "scene_tags": [],
@@ -51,7 +261,9 @@ def _template_pipeline_helpers() -> dict:
         "extract_audio_fn": extract_template_audio,
         "extract_whisper_audio_fn": extract_audio_for_whisper,
         "transcribe_fn": transcribe,
-        "normalize_segments_fn": normalize_segments,
+        "normalize_segments_fn": lambda raw: normalize_segments(
+            raw, normalize_text=normalize_chinese_subtitle
+        ),
         "write_srt_fn": write_srt,
         "write_ass_fn": write_ass,
         "attach_subtitles_fn": attach_subtitles_to_slots,
@@ -95,59 +307,8 @@ def enqueue_template_processing(
     return task_id
 
 
-def run_cmd(cmd, cwd=None):
-    print("执行命令:", " ".join(map(str, cmd)))
-
-    result = subprocess.run(
-        cmd,
-        cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="ignore"
-    )
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            "命令执行失败:\n"
-            + " ".join(map(str, cmd))
-            + "\n\nSTDOUT:\n"
-            + result.stdout
-            + "\n\nSTDERR:\n"
-            + result.stderr
-        )
-
-    return result
-
-
 def file_ok(path: str) -> bool:
     return bool(path) and os.path.exists(path) and os.path.getsize(path) > 0
-
-
-def has_audio_stream(video_path: str) -> bool:
-    if not video_path or not os.path.exists(video_path):
-        return False
-
-    cmd = [
-        "ffprobe",
-        "-v", "error",
-        "-select_streams", "a:0",
-        "-show_entries", "stream=index",
-        "-of", "csv=p=0",
-        str(video_path)
-    ]
-
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="ignore"
-    )
-
-    return bool(result.stdout.strip())
 
 
 def extract_template_audio(video_path: str, output_path: str):
@@ -175,137 +336,6 @@ def extract_audio_for_whisper(video_path: str, output_path: str):
 
     if not file_ok(output_path):
         raise RuntimeError("Whisper 音频提取失败")
-
-
-def normalize_segments(raw_segments: Any) -> List[Dict[str, Any]]:
-    """
-    把 subtitle_gen.transcribe 返回的数据统一转成 JSON 可存储格式。
-    """
-    if raw_segments is None:
-        return []
-
-    if isinstance(raw_segments, tuple) and len(raw_segments) >= 1:
-        raw_segments = raw_segments[0]
-
-    normalized = []
-
-    for seg in list(raw_segments):
-        if isinstance(seg, dict):
-            start = float(seg.get("start", 0))
-            end = float(seg.get("end", 0))
-            text = normalize_chinese_subtitle(str(seg.get("text", "")).strip())
-        else:
-            start = float(getattr(seg, "start", 0))
-            end = float(getattr(seg, "end", 0))
-            text = normalize_chinese_subtitle(str(getattr(seg, "text", "")).strip())
-
-        if not text:
-            continue
-
-        if end <= start:
-            continue
-
-        normalized.append({
-            "start": start,
-            "end": end,
-            "duration": end - start,
-            "text": text
-        })
-
-    return normalized
-
-
-def format_srt_time(seconds: float) -> str:
-    total_ms = int(round(seconds * 1000))
-
-    h = total_ms // 3600000
-    total_ms %= 3600000
-
-    m = total_ms // 60000
-    total_ms %= 60000
-
-    s = total_ms // 1000
-    ms = total_ms % 1000
-
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-
-def format_ass_time(seconds: float) -> str:
-    total_cs = int(round(seconds * 100))
-
-    h = total_cs // 360000
-    total_cs %= 360000
-
-    m = total_cs // 6000
-    total_cs %= 6000
-
-    s = total_cs // 100
-    cs = total_cs % 100
-
-    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
-
-
-def write_srt(segments: List[Dict[str, Any]], output_path: str):
-    """
-    生成 SRT 字幕。
-    """
-    with open(output_path, "w", encoding="utf-8") as f:
-        for index, seg in enumerate(segments, start=1):
-            start = format_srt_time(float(seg["start"]))
-            end = format_srt_time(float(seg["end"]))
-            text = seg["text"]
-
-            f.write(f"{index}\n")
-            f.write(f"{start} --> {end}\n")
-            f.write(f"{text}\n\n")
-
-
-def ass_escape(text: str) -> str:
-    return (
-        text.replace("\\", "\\\\")
-        .replace("{", "\\{")
-        .replace("}", "\\}")
-        .replace("\n", "\\N")
-    )
-
-
-def write_ass(
-    segments: List[Dict[str, Any]],
-    output_path: str,
-    width: int = 1080,
-    height: int = 1920
-):
-    """
-    生成 ASS 字幕。
-    这里不是提取模板原始花字特效，而是生成统一样式字幕。
-    """
-    header = f"""[Script Info]
-Title: AI Travel Cut Template Subtitle
-ScriptType: v4.00+
-Collisions: Normal
-PlayResX: {width}
-PlayResY: {height}
-Timer: 100.0000
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Microsoft YaHei,54,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,3,0,2,60,60,120,1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"""
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(header)
-
-        for seg in segments:
-            start = format_ass_time(float(seg["start"]))
-            end = format_ass_time(float(seg["end"]))
-            text = ass_escape(seg["text"])
-
-            f.write(
-                f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}\n"
-            )
 
 
 def attach_subtitles_to_slots(
@@ -592,11 +622,62 @@ def analyze_template_media(template_id: str, db: Session = Depends(get_db)):
     }
 
 
+@router.post("/{template_id}/analyze-effects")
+def analyze_template_effects(template_id: str, db: Session = Depends(get_db)):
+    """对已有模板重新运行 AI 槽位特效分析（调色/动效/字幕动画）。"""
+    from services.template_effects_analyzer import enrich_slots_with_ai_effects
+
+    template = db.query(Template).filter(Template.id == template_id).first()
+    if not template:
+        raise HTTPException(status_code=404, detail="模板不存在")
+    if not template.file_path or not os.path.isfile(template.file_path):
+        raise HTTPException(status_code=400, detail="模板视频文件不存在")
+
+    template_dir = os.path.dirname(template.file_path)
+    slots = list(template.slots or [])
+    if not slots:
+        raise HTTPException(status_code=400, detail="模板尚无槽位")
+
+    try:
+        enriched = enrich_slots_with_ai_effects(template.file_path, slots, template_dir)
+        template.slots = enriched
+        db.commit()
+        db.refresh(template)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"特效分析失败: {exc}") from exc
+
+    return {
+        "success": True,
+        "template_id": template_id,
+        "slots": template.slots,
+        "analyzed_count": sum(1 for s in (template.slots or []) if isinstance(s, dict) and s.get("auto_effects")),
+    }
+
+
 @router.get("/{template_id}/status")
 def get_template_status(template_id: str, db: Session = Depends(get_db)):
     template = db.query(Template).filter(Template.id == template_id).first()
     if not template:
         raise HTTPException(status_code=404, detail="模板不存在")
+
+    slots = template.slots or []
+    slots_ai_ready = sum(
+        1
+        for s in slots
+        if isinstance(s, dict)
+        and (
+            s.get("ai_description")
+            or (isinstance(s.get("scene_tags"), list) and len(s.get("scene_tags") or []) > 0)
+        )
+    )
+    slots_subtitle_ready = sum(
+        1 for s in slots if isinstance(s, dict) and str(s.get("subtitle_text") or "").strip()
+    )
+    from services.template_subtitle_auto import is_subtitle_batch_running
+    from services.subtitle_status import build_template_subtitle_status
+    from services.processing_config import SUBTITLE_RECOGNITION_MODE
+
+    subtitle_status = build_template_subtitle_status(template)
 
     return {
         "template_id": template.id,
@@ -606,18 +687,24 @@ def get_template_status(template_id: str, db: Session = Depends(get_db)):
         "enhance_progress": getattr(template, "enhance_progress", 100) or 100,
         "audio_ready": bool(getattr(template, "audio_path", "")),
         "subtitle_ready": bool(getattr(template, "subtitle_srt_path", "")),
+        "subtitle_batch_running": is_subtitle_batch_running(template.id),
         "beat_markers": getattr(template, "beat_markers", []) or [],
         "sfx_markers": getattr(template, "sfx_markers", []) or [],
         "segments_json": getattr(template, "segments_json", []) or [],
-        "slot_count": getattr(template, "slot_count", 0) or len(template.slots or []),
-        "slots_ai_ready_count": sum(
-            1 for s in (template.slots or []) if isinstance(s, dict) and s.get("ai_description")
-        ),
+        "slot_count": getattr(template, "slot_count", 0) or len(slots),
+        "slots_ai_ready_count": slots_ai_ready,
+        "slots_subtitle_ready_count": slots_subtitle_ready,
+        "subtitle_recognition_mode": SUBTITLE_RECOGNITION_MODE,
+        "subtitle_empty_count": subtitle_status["empty_count"],
+        "subtitle_low_count": subtitle_status["low_count"],
+        "subtitle_duplicate_count": subtitle_status["duplicate_count"],
+        "subtitle_progress_label": subtitle_status["progress_label"],
+        "ai_understanding_ready": slots_ai_ready >= max(1, len(slots) // 2),
         "ai_vision": getattr(template, "ai_vision_json", None) or {},
         "duration": template.duration,
         "proxy_paths": normalize_proxy_paths(getattr(template, "proxy_paths", None)),
         "editable": getattr(template, "processing_status", "ready") == "ready"
-        and (getattr(template, "slot_count", 0) or len(template.slots or [])) > 0,
+        and (getattr(template, "slot_count", 0) or len(slots)) > 0,
     }
 
 
@@ -671,6 +758,36 @@ def get_template_waveform(template_id: str, bars: int = 300, db: Session = Depen
     }
 
 
+@router.get("/{template_id}/timeline-thumbnails")
+def get_template_timeline_thumbnails(
+    template_id: str,
+    generate: bool = True,
+    include_high: bool = False,
+    db: Session = Depends(get_db),
+):
+    """返回模板多档位时间轴缩略图，供导轨 filmstrip 预览。"""
+    from services.timeline_thumbnails import get_timeline_thumbnail_profiles
+
+    t = db.query(Template).filter(Template.id == template_id).first()
+    if not t:
+        raise HTTPException(status_code=404, detail="模板不存在")
+
+    video_path = resolve_storage_path(t.file_path) if t.file_path else ""
+    if not video_path or not os.path.isfile(video_path):
+        raise HTTPException(status_code=404, detail="模板视频不存在")
+
+    payload = get_timeline_thumbnail_profiles(
+        video_path,
+        template_id,
+        generate_missing=generate,
+        include_high=include_high,
+    )
+    return {
+        "success": True,
+        **payload,
+    }
+
+
 @router.get("/{template_id}")
 def get_template(template_id: str, db: Session = Depends(get_db)):
     """
@@ -693,7 +810,160 @@ def get_template(template_id: str, db: Session = Depends(get_db)):
         "subtitle_ass_path": getattr(t, "subtitle_ass_path", ""),
         "subtitle_style": getattr(t, "subtitle_style", ""),
         "segments_json": getattr(t, "segments_json", []),
+        "subtitle_clips_json": getattr(t, "subtitle_clips_json", []) or [],
+        "subtitleClips": getattr(t, "subtitle_clips_json", []) or [],
+        "cutStrategy": (
+            getattr(t, "cut_strategy", None)
+            or os.getenv("CUT_STRATEGY", "caption_slot")
+        ),
         "sfx_markers": getattr(t, "sfx_markers", []) or [],
         "proxy_paths": normalize_proxy_paths(getattr(t, "proxy_paths", None)),
         "ai_vision": getattr(t, "ai_vision_json", None) or {},
+        **_template_tts_payload(t),
     }
+
+
+@router.get("/voices/list")
+def list_tts_voices():
+    from services.tts.voice_profiles import list_voice_profiles
+
+    profiles = list_voice_profiles()
+    return {"success": True, "voices": profiles, "voiceProfiles": profiles}
+
+
+@router.post("/{template_id}/generate-tts")
+async def generate_template_tts(
+    template_id: str,
+    req: GenerateTtsRequest,
+    db: Session = Depends(get_db),
+):
+    template = db.query(Template).filter(Template.id == template_id).first()
+    if not template:
+        raise HTTPException(status_code=404, detail="模板不存在")
+
+    from services.tts.tts_pipeline import build_pipeline_debug, ensure_clip_timeline_fields, generate_tts_for_clips
+
+    clips = ensure_clip_timeline_fields(getattr(template, "subtitle_clips_json", []) or [])
+    if not clips:
+        raise HTTPException(status_code=400, detail="没有可用的字幕片段，请先识别字幕")
+
+    try:
+        result = generate_tts_for_clips(
+            template_id,
+            clips,
+            voice_id=req.voice_id,
+            clip_ids=req.clip_ids or None,
+            overwrite=req.overwrite,
+            existing_segments=getattr(template, "tts_segments_json", []) or [],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    template.subtitle_clips_json = result.get("clips") or clips
+    template.tts_segments_json = result.get("tts_segments") or []
+    template.voice_id = req.voice_id
+    template.pipeline_stage = "tts_generated"
+    flag_modified(template, "subtitle_clips_json")
+    flag_modified(template, "tts_segments_json")
+    db.commit()
+    db.refresh(template)
+
+    pipeline_debug = build_pipeline_debug(
+        clips=template.subtitle_clips_json,
+        tts_segments=template.tts_segments_json,
+        slots=getattr(template, "slots", []) or [],
+        pipeline_stage="tts_generated",
+        voice_id=req.voice_id,
+    )
+    return {
+        "success": True,
+        "ttsSegments": template.tts_segments_json,
+        "subtitleClips": template.subtitle_clips_json,
+        "summary": result.get("summary") or {},
+        "debug": result.get("debug") or {},
+        "pipelineDebug": pipeline_debug,
+    }
+
+
+@router.post("/{template_id}/align-timeline-to-tts")
+async def align_template_timeline_to_tts(
+    template_id: str,
+    db: Session = Depends(get_db),
+):
+    template = db.query(Template).filter(Template.id == template_id).first()
+    if not template:
+        raise HTTPException(status_code=404, detail="模板不存在")
+
+    from services.tts.tts_pipeline import (
+        align_timeline_to_tts,
+        build_pipeline_debug,
+        ensure_clip_timeline_fields,
+        get_timeline_timing_mode,
+    )
+
+    clips = ensure_clip_timeline_fields(getattr(template, "subtitle_clips_json", []) or [])
+    tts_segments = getattr(template, "tts_segments_json", []) or []
+    if not clips:
+        raise HTTPException(status_code=400, detail="没有可用的字幕片段")
+    if not tts_segments:
+        raise HTTPException(status_code=400, detail="请先生成 AI 人声")
+
+    aligned_clips, aligned_segments, total_duration = align_timeline_to_tts(clips, tts_segments)
+    timing_mode = get_timeline_timing_mode()
+
+    template.subtitle_clips_json = aligned_clips
+    template.tts_segments_json = aligned_segments
+    template.timeline_timing_mode = timing_mode
+    template.pipeline_stage = "timeline_aligned"
+    if float(getattr(template, "duration", 0) or 0) < total_duration:
+        template.duration = total_duration
+    flag_modified(template, "subtitle_clips_json")
+    flag_modified(template, "tts_segments_json")
+    db.commit()
+    db.refresh(template)
+
+    pipeline_debug = build_pipeline_debug(
+        clips=aligned_clips,
+        tts_segments=aligned_segments,
+        slots=getattr(template, "slots", []) or [],
+        pipeline_stage="timeline_aligned",
+        voice_id=getattr(template, "voice_id", "") or "",
+        timing_mode=timing_mode,
+    )
+    return {
+        "success": True,
+        "alignedCaptionClips": aligned_clips,
+        "subtitleClips": aligned_clips,
+        "ttsSegments": aligned_segments,
+        "totalDuration": total_duration,
+        "timingMode": timing_mode,
+        "pipelineDebug": pipeline_debug,
+    }
+
+
+@router.post("/{template_id}/ai-split-by-captions")
+async def ai_split_template_by_captions(
+    template_id: str,
+    req: AiSplitByCaptionsRequest,
+    db: Session = Depends(get_db),
+):
+    """AI 一键分割画面：每个 CaptionClip → 一个 slot。"""
+    template = db.query(Template).filter(Template.id == template_id).first()
+    if not template:
+        raise HTTPException(status_code=404, detail="模板不存在")
+    if str(req.source or "caption_clips") != "caption_clips":
+        raise HTTPException(status_code=400, detail="当前仅支持 source=caption_clips")
+    return _run_ai_split_template(template, req, db)
+
+
+@router.post("/{template_id}/ai-split-by-visual")
+async def ai_split_template_by_visual(
+    template_id: str,
+    req: AiSplitByVisualRequest,
+    db: Session = Depends(get_db),
+):
+    """按原视频画面镜头切分：PySceneDetect 检测切点，字幕按时间重叠关联到各镜头。"""
+    template = db.query(Template).filter(Template.id == template_id).first()
+    if not template:
+        raise HTTPException(status_code=404, detail="模板不存在")
+    return _run_visual_split_template(template, req, db)

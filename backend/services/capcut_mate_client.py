@@ -155,7 +155,7 @@ def create_draft(width: int, height: int) -> dict[str, Any]:
     raise RuntimeError("剪映草稿创建失败")
 
 
-ADD_VIDEOS_BATCH_SIZE = int(os.getenv("CAPCUT_ADD_VIDEOS_BATCH_SIZE", "8"))
+ADD_VIDEOS_BATCH_SIZE = int(os.getenv("CAPCUT_ADD_VIDEOS_BATCH_SIZE", "9999"))
 
 
 def add_videos(
@@ -229,21 +229,28 @@ def add_captions(
     captions: list[dict[str, Any]],
     *,
     text_color: str = "#ffffff",
+    border_color: str | None = None,
     font_size: int = 18,
     alignment: int = 1,
     transform_y: int = -400,
+    bold: bool = False,
+    text_effect: str | None = None,
 ) -> dict[str, Any]:
-    return _post(
-        "/add_captions",
-        {
-            "draft_url": draft_url,
-            "captions": json.dumps(captions, ensure_ascii=False),
-            "text_color": text_color,
-            "font_size": font_size,
-            "alignment": alignment,
-            "transform_y": transform_y,
-        },
-    )
+    payload: dict[str, Any] = {
+        "draft_url": draft_url,
+        "captions": json.dumps(captions, ensure_ascii=False),
+        "text_color": text_color,
+        "font_size": font_size,
+        "alignment": alignment,
+        "transform_y": transform_y,
+    }
+    if border_color:
+        payload["border_color"] = border_color
+    if bold:
+        payload["bold"] = True
+    if text_effect:
+        payload["text_effect"] = text_effect
+    return _post("/add_captions", payload)
 
 
 def save_draft(draft_url: str, *, clip_count: int = 1) -> dict[str, Any]:

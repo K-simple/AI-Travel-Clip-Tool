@@ -12,14 +12,13 @@ export function apiUrl(path: string): string {
   return `${API_BASE.replace(/\/$/, '')}${normalized}`;
 }
 
-/** Whisper 等长耗时请求直连后端，绕过 Next.js /api 代理 ~30s 超时 */
+/** 长耗时字幕请求：浏览器走同源 API Route 代理，避免 CORS 与直连失败 */
 export function longRunningApiUrl(path: string): string {
   const normalized = path.startsWith('/') ? path : `/${path}`;
-  const base =
-    typeof window !== 'undefined'
-      ? API_BASE || 'http://127.0.0.1:8000'
-      : API_BASE || 'http://127.0.0.1:8000';
-  if (!base) return normalized;
+  if (typeof window !== 'undefined') {
+    return normalized;
+  }
+  const base = API_BASE || 'http://127.0.0.1:8000';
   return `${base.replace(/\/$/, '')}${normalized}`;
 }
 
@@ -47,8 +46,8 @@ export function apiHeaders(): HeadersInit {
   return headers;
 }
 
-/** Next.js /api 代理约 30s 超时，Whisper 批量需控制每批槽位数 */
-export const SUBTITLE_BATCH_CHUNK_SIZE = 8;
+/** 批量识别：整段 Whisper 一次 + 每槽 OCR，可整批提交 */
+export const SUBTITLE_BATCH_CHUNK_SIZE = 25;
 
 export function formatApiDetail(detail: unknown, fallback: string): string {
   if (typeof detail === 'string' && detail.trim()) return detail;
@@ -76,7 +75,7 @@ export async function readApiJson(resp: Response): Promise<Record<string, unknow
     const snippet = text.trim().slice(0, 160);
     throw new Error(
       resp.ok
-        ? '服务端返回格式异常'
+        ? '服务器响应无效（非 JSON），请执行 scripts/restart-all.ps1 重启 backend 后重试'
         : snippet || `请求失败 (${resp.status})`
     );
   }

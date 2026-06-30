@@ -6,7 +6,7 @@ export type GlobalStatusItem = {
   detail?: string;
   progress: number;
   indeterminate?: boolean;
-  status: 'processing' | 'ready' | 'failed' | 'idle';
+  status: 'processing' | 'ready' | 'failed' | 'idle' | 'warning';
 };
 
 type GlobalStatusBarProps = {
@@ -15,7 +15,10 @@ type GlobalStatusBarProps = {
 };
 
 export default function GlobalStatusBar({ items, autosaveLabel }: GlobalStatusBarProps) {
-  const active = items.filter((item) => item.status === 'processing' || item.status === 'failed');
+  const active = items.filter(
+    (item) =>
+      item.status === 'processing' || item.status === 'failed' || item.status === 'warning'
+  );
   if (!active.length && !autosaveLabel) return null;
 
   return (
@@ -27,12 +30,18 @@ export default function GlobalStatusBar({ items, autosaveLabel }: GlobalStatusBa
             className={`flex min-w-0 max-w-full flex-1 basis-[min(100%,280px)] items-center gap-2.5 rounded-lg border px-3 py-1.5 sm:min-w-[200px] sm:basis-auto ${
               item.status === 'failed'
                 ? 'border-red-500/25 bg-red-500/10'
-                : 'border-editor-border bg-editor-panel-2/80'
+                : item.status === 'warning'
+                  ? 'border-amber-500/25 bg-amber-500/10'
+                  : 'border-editor-border bg-editor-panel-2/80'
             }`}
           >
             <span
               className={`min-w-0 truncate text-[11px] font-medium ${
-                item.status === 'failed' ? 'text-editor-danger' : 'text-editor-accent'
+                item.status === 'failed'
+                  ? 'text-editor-danger'
+                  : item.status === 'warning'
+                    ? 'text-amber-300'
+                    : 'text-editor-accent'
               }`}
               title={item.detail ? `${item.label} · ${item.detail}` : item.label}
             >

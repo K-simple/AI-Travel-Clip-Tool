@@ -54,6 +54,11 @@ class Template(Base):
     subtitle_ass_path = Column(String, default="")
     subtitle_style = Column(Text, default="")
     segments_json = Column(JSON, default=list)
+    subtitle_clips_json = Column(JSON, default=list)
+    tts_segments_json = Column(JSON, default=list)
+    voice_id = Column(String, default="")
+    pipeline_stage = Column(String, default="")
+    timeline_timing_mode = Column(String, default="tts_driven")
     processing_status = Column(String, default="ready")
     processing_progress = Column(Integer, default=100)
     beat_markers = Column(JSON, default=list)
@@ -117,6 +122,11 @@ def migrate_db():
         "ALTER TABLE templates ADD COLUMN enhance_progress INTEGER DEFAULT 100",
         "ALTER TABLE templates ADD COLUMN ai_vision_json JSON DEFAULT '{}'",
         "ALTER TABLE templates ADD COLUMN sfx_markers JSON DEFAULT '[]'",
+        "ALTER TABLE templates ADD COLUMN subtitle_clips_json JSON DEFAULT '[]'",
+        "ALTER TABLE templates ADD COLUMN tts_segments_json JSON DEFAULT '[]'",
+        "ALTER TABLE templates ADD COLUMN voice_id VARCHAR DEFAULT ''",
+        "ALTER TABLE templates ADD COLUMN pipeline_stage VARCHAR DEFAULT ''",
+        "ALTER TABLE templates ADD COLUMN timeline_timing_mode VARCHAR DEFAULT 'tts_driven'",
     ]
     with engine.connect() as conn:
         for stmt in migrations:

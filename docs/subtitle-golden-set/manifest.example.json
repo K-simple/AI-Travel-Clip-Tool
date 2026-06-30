@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "burned-travel-01",
+      "category": "burned_in",
+      "description": "烧录字幕旅游竖屏样片",
+      "template_video": "samples/burned-travel-01.mp4",
+      "expected_file": "expected/burned-travel-01.json",
+      "min_nonempty_rate": 0.9
+    },
+    {
+      "id": "voiceover-01",
+      "category": "voiceover",
+      "description": "纯口播无烧录字幕",
+      "template_video": "samples/voiceover-01.mp4",
+      "expected_file": "expected/voiceover-01.json",
+      "min_nonempty_rate": 0.85
+    },
+    {
+      "id": "weak-audio-01",
+      "category": "weak_audio",
+      "description": "BGM 重、人声弱，允许部分空槽",
+      "template_video": "samples/weak-audio-01.mp4",
+      "expected_file": "expected/weak-audio-01.json",
+      "min_nonempty_rate": 0.5,
+      "allow_empty": true
+    }
+  ]
+}

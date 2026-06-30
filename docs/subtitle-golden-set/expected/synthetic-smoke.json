@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "description": "单元测试用合成期望（无需 mp4）",
+  "slots": [
+    { "subtitle_text": "欢迎来到云南" },
+    { "subtitle_text": "今天天气真好" },
+    { "subtitle_text": "" }
+  ]
+}

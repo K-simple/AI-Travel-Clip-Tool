@@ -1,11 +1,17 @@
 'use client';
 
 import EffectsPanel from '@/components/EffectsPanel';
-import { describeSubtitleStyle, parseSubtitleSegments, type SfxMarker } from '@/lib/slotEdit';
+import { describeSubtitleSceneMatch, describeSubtitleStyle, parseSubtitleSegments, type SfxMarker } from '@/lib/slotEdit';
 import { isTrackLocked, type TrackControls, type TrackKey } from '@/lib/trackControls';
 import type { MatchStrategy } from '@/lib/matchStrategy';
 import type { TemplateAiVision } from '@/lib/useTemplateProcessing';
 import { DEFAULT_SLOT_EFFECTS, type SlotEffects } from '@/lib/slotEffects';
+import {
+  labelSubtitleQuality,
+  labelSubtitleSource,
+  slotSubtitleWarning,
+  subtitleQualityTone,
+} from '@/lib/subtitleStatus';
 
 export type MatchWeights = {
   tags_weight: number;
@@ -32,6 +38,14 @@ type SelectedSlot = {
   ai_tags?: string[];
   ai_replace_hint?: string;
   ai_subject?: string;
+  subtitle_visual_context?: string;
+  subtitle_scene_match?: number;
+  subtitle_scene_match_reason?: string;
+  subtitle_effect_label?: string;
+  subtitle_style?: import('@/lib/slotEdit').SubtitleStyle;
+  subtitle_source?: string;
+  subtitle_quality?: 'ok' | 'low' | 'empty';
+  subtitle_status_reason?: string;
   speed?: number;
   opticalFlow?: boolean;
   keyframes?: SlotEffects['keyframes'];
@@ -69,9 +83,7 @@ type PropertiesPanelProps = {
   onAutoMatch: () => void;
   onToggleTemplateMusic: () => void;
   onRecognizeSlotSubtitle?: () => void;
-  onRecognizeAllSubtitles?: () => void;
   recognizingSubtitle?: boolean;
-  recognizingAllSubtitles?: boolean;
   templateId?: string | null;
   onImportTemplate?: () => void;
   onMoveSlot?: (slotId: string, direction: -1 | 1) => void;
@@ -163,8 +175,6 @@ export default function PropertiesPanel({
   onToggleTemplateMusic,
   onRecognizeSlotSubtitle,
   recognizingSubtitle = false,
-  onRecognizeAllSubtitles,
-  recognizingAllSubtitles = false,
   templateId,
   onImportTemplate,
   onMoveSlot,
@@ -173,13 +183,31 @@ export default function PropertiesPanel({
 }: PropertiesPanelProps) {
   const hasTemplate = !!templateId && slotCount > 0;
   const subtitleStyleHint = selectedSlot
-    ? describeSubtitleStyle(parseSubtitleSegments(selectedSlot.subtitle_segments)[0]?.style)
+    ? describeSubtitleStyle(
+        selectedSlot.subtitle_style ||
+          parseSubtitleSegments(selectedSlot.subtitle_segments)[0]?.style
+      )
+    : '';
+  const subtitleSceneHint = selectedSlot
+    ? describeSubtitleSceneMatch(
+        selectedSlot.subtitle_scene_match,
+        selectedSlot.subtitle_scene_match_reason,
+        selectedSlot.subtitle_visual_context
+      )
     : '';
   const durationWeight = Math.max(0, 1 - matchWeights.tags_weight - matchWeights.visual_weight);
   const clipMax = Math.max(selectedSlot?.duration ?? 0, assetDurationSeconds ?? 30);
   const videoLocked = isTrackLocked(trackControls, 'video');
   const subtitleLocked = isTrackLocked(trackControls, 'subtitle');
   const audioVoiceLocked = isTrackLocked(trackControls, 'audioVoice');
+  const slotSubtitleMetaWarning = selectedSlot ? slotSubtitleWarning(selectedSlot) : '';
+  const slotQualityTone = subtitleQualityTone(selectedSlot?.subtitle_quality);
+  const qualityBadgeClass =
+    slotQualityTone === 'ok'
+      ? 'border-[#2d4a2d] bg-[#1a2e1a] text-[#4ade80]'
+      : slotQualityTone === 'warn'
+        ? 'border-[#4a4020] bg-[#2a2410] text-[#face15]'
+        : 'border-[#4a2828] bg-[#2a1818] text-[#f87171]';
 
   const updateWeight = (key: keyof MatchWeights, value: number) => {
     onMatchWeightsChange(normalizeMatchWeights(matchWeights, key, value));
@@ -190,48 +218,6 @@ export default function PropertiesPanel({
       <div className="ui-panel-header shrink-0">
         <h2 className="ui-panel-title">草稿参数</h2>
         <p className="ui-panel-subtitle">{templateName || '尚未选择模板'}</p>
-        {hasTemplate ? (
-          <div className="mt-3 rounded-lg border border-editor-border bg-editor-panel-2 p-2.5">
-            <div className="mb-2 text-xs font-semibold text-editor-text">智能字幕识别</div>
-            <div className="mb-2 text-[10px] leading-relaxed text-editor-subtle">
-              先人声/BGM 分离再转写，质量不佳时自动回退画面 OCR
-            </div>
-            <div className="flex flex-col gap-1.5">
-              {onRecognizeAllSubtitles ? (
-                <button
-                  type="button"
-                  onClick={onRecognizeAllSubtitles}
-                  disabled={recognizingAllSubtitles || !templateId}
-                  className="ui-btn-primary w-full py-1.5 text-[11px]"
-                >
-                  {recognizingAllSubtitles ? '批量识别中…' : '批量识别全部槽位'}
-                </button>
-              ) : null}
-              {onRecognizeSlotSubtitle ? (
-                <button
-                  type="button"
-                  onClick={onRecognizeSlotSubtitle}
-                  disabled={
-                    recognizingSubtitle ||
-                    !templateId ||
-                    !selectedSlot ||
-                    subtitleLocked
-                  }
-                  className="ui-btn w-full py-1.5 text-[11px]"
-                >
-                  {recognizingSubtitle
-                    ? '识别当前槽位中…'
-                    : selectedSlot
-                      ? '识别当前槽位字幕'
-                      : '请先在时间轴选择槽位'}
-                </button>
-              ) : null}
-            </div>
-            <p className="mt-2 text-[10px] leading-relaxed text-editor-subtle">
-              也可在左侧「字幕」标签页中批量识别画面字幕与编辑
-            </p>
-          </div>
-        ) : null}
       </div>
 
       <div className="panel-scroll flex-1 overflow-y-auto px-4 py-2">
@@ -309,7 +295,7 @@ export default function PropertiesPanel({
               <p className="mt-2 text-[10px] leading-relaxed text-[#666]">
                 {asset
                   ? '点击「换素材」后，从左侧素材库拖一个新视频到时间轴对应槽位'
-                  : '从左侧素材库拖拽视频到时间轴，或点击右侧「AI 自动匹配」'}
+                  : 'AI 理解模板画面后从素材库挑选相近片段；也可手动拖拽替换'}
               </p>
             </div>
 
@@ -339,6 +325,28 @@ export default function PropertiesPanel({
               ) : null}
               {selectedSlot.scene_tags?.length ? (
                 <ParamRow label="匹配标签" value={selectedSlot.scene_tags.join(' · ')} />
+              ) : null}
+              {selectedSlot.subtitle_source || selectedSlot.subtitle_quality ? (
+                <div className="flex items-start justify-between gap-3 rounded-lg px-1 py-2.5 text-xs even:bg-editor-panel-2/40">
+                  <span className="shrink-0 text-editor-muted">字幕来源</span>
+                  <div className="text-right">
+                    <span className="font-medium text-editor-text">
+                      {labelSubtitleSource(selectedSlot.subtitle_source)}
+                    </span>
+                    {selectedSlot.subtitle_quality ? (
+                      <span
+                        className={`ml-2 inline-flex rounded border px-1.5 py-0.5 text-[10px] ${qualityBadgeClass}`}
+                      >
+                        {labelSubtitleQuality(selectedSlot.subtitle_quality)}
+                      </span>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
+              {slotSubtitleMetaWarning ? (
+                <p className="rounded border border-[#4a2828] bg-[#2a1818] px-2 py-1.5 text-[10px] leading-relaxed text-[#f87171]">
+                  {slotSubtitleMetaWarning}
+                </p>
               ) : null}
             </div>
 
@@ -373,20 +381,29 @@ export default function PropertiesPanel({
                 disabled={subtitleLocked}
                 className="mt-2 w-full resize-none rounded border border-[#3a3a3a] bg-[#141414] p-2 text-xs text-white placeholder:text-[#555] focus:border-[#face15] focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
               />
-              <button
-                type="button"
-                disabled={subtitleLocked || recognizingSubtitle || !templateId || !onRecognizeSlotSubtitle}
-                onClick={onRecognizeSlotSubtitle}
-                className="mt-2 w-full rounded bg-[#2a3a55] py-1.5 text-xs text-[#93c5fd] hover:bg-[#334866] disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                {recognizingSubtitle ? '智能识别中…' : '识别当前槽位字幕'}
-              </button>
+              <div className="mt-2 flex flex-col gap-1.5">
+                {onRecognizeSlotSubtitle ? (
+                  <button
+                    type="button"
+                    disabled={subtitleLocked || recognizingSubtitle || !templateId}
+                    onClick={onRecognizeSlotSubtitle}
+                    className="w-full rounded bg-[#2a3a55] py-1.5 text-xs text-[#93c5fd] hover:bg-[#334866] disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    {recognizingSubtitle ? '识别中…' : '识别当前槽位字幕'}
+                  </button>
+                ) : null}
+              </div>
               <p className="mt-1 text-[10px] leading-relaxed text-[#666]">
-                先人声分离再转写，必要时自动使用画面烧录字幕 OCR
+                批量识别请用左侧「字幕」标签页；识别结果仅供参考，换画面后请自行校对
               </p>
               {subtitleStyleHint ? (
                 <p className="mt-2 rounded border border-[#3a3a3a] bg-[#141414] px-2 py-1.5 text-[10px] leading-relaxed text-[#face15]/90">
-                  花字样式：{subtitleStyleHint}
+                  花字样式：{selectedSlot.subtitle_effect_label || subtitleStyleHint}
+                </p>
+              ) : null}
+              {subtitleSceneHint ? (
+                <p className="mt-2 rounded border border-[#3a3a3a] bg-[#141414] px-2 py-1.5 text-[10px] leading-relaxed text-[#93c5fd]/90">
+                  字幕与画面：{subtitleSceneHint}
                 </p>
               ) : null}
               <div className="mt-2 flex gap-2">
@@ -570,18 +587,8 @@ export default function PropertiesPanel({
           disabled={matching || !hasTemplate}
           className="w-full rounded-md bg-[#face15] py-2.5 text-sm font-semibold text-black hover:bg-[#ffe066] disabled:bg-[#665c20] disabled:text-[#999]"
         >
-          {matching ? 'AI 匹配中…' : 'AI 自动匹配'}
+          {matching ? '智能匹配中…' : 'AI 智能匹配素材'}
         </button>
-        {onRecognizeAllSubtitles ? (
-          <button
-            type="button"
-            onClick={onRecognizeAllSubtitles}
-            disabled={recognizingAllSubtitles || !templateId || !hasTemplate}
-            className="w-full rounded-md bg-[#2a3a55] py-2 text-xs text-[#93c5fd] hover:bg-[#334866] disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            {recognizingAllSubtitles ? '批量识别字幕中…' : '批量识别全部槽位字幕'}
-          </button>
-        ) : null}
       </div>
     </aside>
   );

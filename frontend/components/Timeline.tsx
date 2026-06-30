@@ -7,18 +7,20 @@ import {
   useRef,
   useState,
   type DragEvent,
-  type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from 'react';
-import { buildClipLayouts,
+import {
+  buildMainVideoClipLayouts,
+  buildSubtitleClipLayouts,
+  buildTtsSegmentLayouts,
+  type TtsSegmentLayout,
   buildSubtitleSegmentLayouts,
-  findClipAtTime,
   getTotalDuration,
-  isNearPlayheadX,
-  snapTime,
   type ClipLayout,
   type SegmentLayout,
+  type SubtitleClipLayout,
 } from '@/lib/timelineLayout';
+import { resolveMainTimelineSlots } from '@/lib/slotTimelineHelpers';
 import { describeSfxMarker } from '@/lib/slotEdit';
 import {
   isTrackContentVisible,
@@ -39,14 +41,16 @@ import {
   laneGridStyle,
 } from '@/components/timeline/TimelineTrackClips';
 import { canAcceptTimelineDrop, isFileDrag, isInternalAssetDrag } from '@/lib/timelineDrop';
-import type { TemplateSlot } from '@/lib/timeline';
+import type { SubtitleClip, TemplateSlot, TtsSegment } from '@/lib/timeline';
+import type { PreviewProxyPaths } from '@/lib/previewSettings';
+import { slotSubtitleAttentionLevel } from '@/lib/subtitleStatus';
 import { overlayLayouts, type OverlayClip, type OverlayTracks } from '@/lib/edlModel';
 import { CLIP_GAP, CLIP_INSET, RULER_H, TIMELINE_THEME } from '@/components/timeline/timelineTheme';
 import {
   DEFAULT_VISIBLE_TRACK_KEYS,
   buildActiveTrackLayout,
+  ensureSubtitleTrackVisible,
   getAddableTracks,
-  getTrackDef,
   sortTrackKeys,
 } from '@/lib/timelineTracks';
 import {
@@ -56,17 +60,24 @@ import {
   hasActiveColorGrade,
   hasActiveMask,
 } from '@/lib/slotEffects';
-import { fetchTemplateWaveform, sliceWaveformPeaks } from '@/lib/waveform';
-import { clampTrackHeight, type TrackHeightMap } from '@/lib/trackHeights';
+import { sliceWaveformPeaks } from '@/lib/waveform';
+import { type TrackHeightMap } from '@/lib/trackHeights';
 import { TrackResizeHandle } from '@/components/timeline/TrackResizeHandle';
-import type { PointerEvent as ReactPointerEvent } from 'react';
+import { useTimelineScrub } from '@/lib/useTimelineScrub';
+import { useTimelineTrackResize } from '@/lib/useTimelineTrackResize';
+import { useTimelineWaveform } from '@/lib/useTimelineWaveform';
+import { useTimelineThumbnails } from '@/lib/useTimelineThumbnails';
+import { countRenderedFilmstripFrames } from '@/lib/timelineThumbnails';
 
 const SLOT_REORDER_MIME = 'application/x-slot-reorder';
 
 type TimelineProps = {
   slots: TemplateSlot[];
+  subtitleClips?: SubtitleClip[];
+  ttsSegments?: TtsSegment[];
   assetMap: Record<string, { title: string; thumbnail?: string; filePath?: string }>;
   templateVideoPath?: string;
+  templateProxyPaths?: PreviewProxyPaths;
   selectedSlotId?: string;
   playheadTime?: number;
   isPlaying?: boolean;
@@ -143,8 +154,11 @@ function LaneDropHint({ text }: { text: string }) {
 
 export default function Timeline({
   slots,
+  subtitleClips = [],
+  ttsSegments = [],
   assetMap,
   templateVideoPath = '',
+  templateProxyPaths = {},
   selectedSlotId,
   playheadTime: controlledPlayhead,
   isPlaying = false,
@@ -180,40 +194,37 @@ export default function Timeline({
 }: TimelineProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const reorderDragIdRef = useRef<string | null>(null);
-  const [templateWaveform, setTemplateWaveform] = useState<number[]>([]);
+  const templateWaveform = useTimelineWaveform(templateId);
   const [zoom, setZoom] = useState(1);
   const [magnet, setMagnet] = useState(true);
-  const [internalPlayhead, setInternalPlayhead] = useState(0);
-  const [draggingPlayhead, setDraggingPlayhead] = useState(false);
   const [selectedTrackKey, setSelectedTrackKey] = useState<TrackKey | null>('video');
-  const [visibleTrackKeys, setVisibleTrackKeys] = useState<TrackKey[]>(DEFAULT_VISIBLE_TRACK_KEYS);
+  const hasSubtitleOnTimeline =
+    subtitleClips.length > 0 ||
+    ttsSegments.length > 0 ||
+    slots.some(
+      (s) =>
+        String(s.subtitleText || '').trim() ||
+        (Array.isArray(s.subtitle_segments) && s.subtitle_segments.length > 0)
+    );
+
+  const [visibleTrackKeys, setVisibleTrackKeys] = useState<TrackKey[]>(() =>
+    subtitleClips.length > 0 || ttsSegments.length > 0
+      ? ensureSubtitleTrackVisible(DEFAULT_VISIBLE_TRACK_KEYS)
+      : DEFAULT_VISIBLE_TRACK_KEYS
+  );
   const [viewportWidth, setViewportWidth] = useState(0);
   const [dragOverVideo, setDragOverVideo] = useState(false);
   const [selectedOverlay, setSelectedOverlay] = useState<{ track: 'v2' | 'v3'; id: string } | null>(
     null
   );
-  const scrubMovedRef = useRef(false);
-  const pendingScrubRef = useRef<{ startX: number; active: boolean } | null>(null);
 
-  const selectSlot = useCallback(
-    (slotId: string, opts?: { force?: boolean }) => {
-      if (!opts?.force && scrubMovedRef.current) {
-        scrubMovedRef.current = false;
-        return;
-      }
+  const selectSlotWithOverlayClear = useCallback(
+    (slotId: string) => {
       setSelectedOverlay(null);
       onSlotSelect(slotId);
     },
     [onSlotSelect]
   );
-
-  useEffect(() => {
-    if (!templateId) {
-      setTemplateWaveform([]);
-      return;
-    }
-    void fetchTemplateWaveform(templateId, 400).then(setTemplateWaveform);
-  }, [templateId]);
 
   const handleSlotReorderDragStart = useCallback((e: DragEvent<HTMLDivElement>, slotId: string) => {
     reorderDragIdRef.current = slotId;
@@ -231,17 +242,17 @@ export default function Timeline({
     [onReorderSlots]
   );
 
-  const playheadTime = controlledPlayhead ?? internalPlayhead;
-  const setPlayhead = useCallback(
-    (t: number) => {
-      if (onPlayheadChange) onPlayheadChange(t);
-      else setInternalPlayhead(t);
-    },
-    [onPlayheadChange]
+  const mainTimelineSlots = useMemo(
+    () => resolveMainTimelineSlots(slots, subtitleClips),
+    [slots, subtitleClips]
   );
-
   const pxPerSec = BASE_PX_PER_SEC * zoom;
-  const totalDuration = getTotalDuration(slots);
+  const {
+    timelineThumbnails,
+    loading: timelineThumbnailsLoading,
+    sampleIntervalSec,
+  } = useTimelineThumbnails(templateId, pxPerSec);
+  const totalDuration = getTotalDuration(mainTimelineSlots);
   const activeTrackLayout = useMemo(
     () => buildActiveTrackLayout(visibleTrackKeys, trackHeights),
     [visibleTrackKeys, trackHeights]
@@ -250,7 +261,49 @@ export default function Timeline({
   const contentWidth = Math.max(totalDuration * pxPerSec + 120, viewportWidth, 480);
   const displayDuration = Math.max(totalDuration, contentWidth / pxPerSec);
   const scrubMaxDuration = displayDuration;
-  const clipLayouts = useMemo(() => buildClipLayouts(slots, pxPerSec), [slots, pxPerSec]);
+  const clipLayouts = useMemo(
+    () => buildMainVideoClipLayouts(slots, subtitleClips, pxPerSec),
+    [slots, subtitleClips, pxPerSec]
+  );
+
+  useEffect(() => {
+    if (process.env.NODE_ENV !== 'development') return;
+    const slotFilmstripInputs = clipLayouts.map((layout) => {
+      const slot = layout.slot;
+      const sourceStart =
+        slot.slotStart ?? slot.templateSourceStart ?? slot.clipStart ?? 0;
+      const sourceEnd =
+        slot.slotEnd ?? sourceStart + Math.max(0.1, slot.duration);
+      return {
+        slotStart: sourceStart,
+        slotEnd: sourceEnd,
+        widthPx: layout.width,
+      };
+    });
+    const renderedThumbnailCount = countRenderedFilmstripFrames(
+      timelineThumbnails,
+      slotFilmstripInputs,
+      pxPerSec,
+      sampleIntervalSec
+    );
+    console.log({
+      filmstripDebug: {
+        templateThumbnailCount: timelineThumbnails.length,
+        renderedThumbnailCount,
+        slotCount: clipLayouts.length,
+        pxPerSecond: pxPerSec,
+        sampleIntervalSec,
+      },
+    });
+  }, [clipLayouts, timelineThumbnails, pxPerSec, sampleIntervalSec]);
+  const subtitleClipLayouts = useMemo(
+    () => (subtitleClips.length ? buildSubtitleClipLayouts(subtitleClips, slots, pxPerSec) : []),
+    [subtitleClips, slots, pxPerSec]
+  );
+  const ttsSegmentLayouts = useMemo(
+    () => (ttsSegments.length ? buildTtsSegmentLayouts(ttsSegments, pxPerSec) : []),
+    [ttsSegments, pxPerSec]
+  );
   const subtitleLayouts = useMemo(
     () => buildSubtitleSegmentLayouts(slots, pxPerSec),
     [slots, pxPerSec]
@@ -266,49 +319,10 @@ export default function Timeline({
   const tickStep = zoom >= 1.8 ? 1 : zoom >= 1 ? 2 : 5;
   const gridStyle = useMemo(() => laneGridStyle(pxPerSec), [pxPerSec]);
 
-  const trackHeight = useCallback(
-    (key: TrackKey) => activeTrackLayout.find((t) => t.key === key)?.height ?? getTrackDef(key)?.height ?? 32,
-    [activeTrackLayout]
-  );
-
-  const beginTrackResize = useCallback(
-    (key: TrackKey, event: ReactPointerEvent<HTMLDivElement>) => {
-      if (!onTrackHeightChange) return;
-      event.preventDefault();
-      event.stopPropagation();
-      const startY = event.clientY;
-      const startHeight = trackHeight(key);
-      const pointerId = event.pointerId;
-      const handle = event.currentTarget;
-      handle.setPointerCapture(pointerId);
-
-      const onMove = (ev: PointerEvent) => {
-        onTrackHeightChange(key, clampTrackHeight(startHeight + (ev.clientY - startY)));
-      };
-      const onUp = () => {
-        try {
-          handle.releasePointerCapture(pointerId);
-        } catch {
-          /* ignore */
-        }
-        window.removeEventListener('pointermove', onMove);
-        window.removeEventListener('pointerup', onUp);
-        window.removeEventListener('pointercancel', onUp);
-      };
-
-      window.addEventListener('pointermove', onMove);
-      window.addEventListener('pointerup', onUp);
-      window.addEventListener('pointercancel', onUp);
-    },
-    [onTrackHeightChange, trackHeight]
-  );
-
-  const resetTrackHeight = useCallback(
-    (key: TrackKey) => {
-      onTrackHeightChange?.(key, null);
-    },
-    [onTrackHeightChange]
-  );
+  const { trackHeight, beginTrackResize, resetTrackHeight } = useTimelineTrackResize({
+    activeTrackLayout,
+    onTrackHeightChange,
+  });
 
   const handleAddTrack = useCallback(
     (key: TrackKey) => {
@@ -322,6 +336,17 @@ export default function Timeline({
   );
 
   useEffect(() => {
+    if (!hasSubtitleOnTimeline) return;
+    setVisibleTrackKeys((prev) => ensureSubtitleTrackVisible(prev));
+    if (!trackControls.subtitle.visible) {
+      onTrackControlToggle('subtitle', 'visible');
+    }
+    if (ttsSegments.length > 0 && !trackControls.ttsVoice.visible) {
+      onTrackControlToggle('ttsVoice', 'visible');
+    }
+  }, [hasSubtitleOnTimeline, ttsSegments.length, trackControls.subtitle.visible, trackControls.ttsVoice.visible, onTrackControlToggle]);
+
+  useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     const update = () => setViewportWidth(el.clientWidth);
@@ -331,177 +356,33 @@ export default function Timeline({
     return () => ro.disconnect();
   }, []);
 
-  const timeFromClientX = useCallback(
-    (clientX: number) => {
-      const el = scrollRef.current;
-      if (!el) return 0;
-      const rect = el.getBoundingClientRect();
-      const x = clientX - rect.left + el.scrollLeft;
-      return snapTime(x / pxPerSec, clipLayouts, magnet, subtitleLayouts);
-    },
-    [pxPerSec, clipLayouts, magnet, subtitleLayouts]
-  );
-
-  const scrubAtClientX = useCallback(
-    (clientX: number, options?: { selectSlot?: boolean }) => {
-      const el = scrollRef.current;
-      if (el) {
-        const rect = el.getBoundingClientRect();
-        const edge = 56;
-        if (clientX < rect.left + edge) {
-          el.scrollLeft = Math.max(0, el.scrollLeft - Math.max(8, Math.ceil((rect.left + edge - clientX) / 3)));
-        } else if (clientX > rect.right - edge) {
-          el.scrollLeft += Math.max(8, Math.ceil((clientX - (rect.right - edge)) / 3));
-        }
-      }
-      const t = Math.min(Math.max(0, timeFromClientX(clientX)), scrubMaxDuration);
-      setPlayhead(t);
-      if (options?.selectSlot !== false) {
-        const clip = findClipAtTime(clipLayouts, t);
-        if (clip) selectSlot(clip.slot.id, { force: true });
-      }
-    },
-    [timeFromClientX, scrubMaxDuration, setPlayhead, clipLayouts, selectSlot]
-  );
-
-  const seekTo = useCallback(
-    (clientX: number, options?: { selectSlot?: boolean }) => {
-      scrubAtClientX(clientX, options);
-    },
-    [scrubAtClientX]
-  );
-
-  const beginScrub = useCallback(
-    (clientX: number, trackKey?: TrackKey) => {
-      onScrubStart?.();
-      scrubMovedRef.current = false;
-      if (trackKey) setSelectedTrackKey(trackKey);
-      setDraggingPlayhead(true);
-      scrubAtClientX(clientX);
-    },
-    [onScrubStart, scrubAtClientX]
-  );
-
-  const moveScrub = useCallback(
-    (clientX: number) => {
-      scrubMovedRef.current = true;
-      scrubAtClientX(clientX);
-    },
-    [scrubAtClientX]
-  );
-
-  const endScrub = useCallback(() => {
-    setDraggingPlayhead(false);
-    pendingScrubRef.current = null;
-  }, []);
-
-  const handleTrackBgMouseDown = (e: ReactMouseEvent, trackKey: TrackKey) => {
-    if (e.button !== 0) return;
-    if ((e.target as HTMLElement).closest('[data-trim-handle]')) return;
-    const onClip = (e.target as HTMLElement).closest('[data-clip]');
-    const el = scrollRef.current;
-    if (onClip && el && !isNearPlayheadX(e.clientX, el, playheadTime, pxPerSec)) {
-      return;
-    }
-    e.preventDefault();
-    beginScrub(e.clientX, trackKey);
-  };
-
-  useEffect(() => {
-    if (!draggingPlayhead) return;
-    const prevUserSelect = document.body.style.userSelect;
-    const prevCursor = document.body.style.cursor;
-    document.body.style.userSelect = 'none';
-    document.body.style.cursor = 'ew-resize';
-
-    const onMove = (e: MouseEvent | PointerEvent) => moveScrub(e.clientX);
-    const onUp = () => endScrub();
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onUp);
-    return () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onUp);
-      document.body.style.userSelect = prevUserSelect;
-      document.body.style.cursor = prevCursor;
-    };
-  }, [draggingPlayhead, moveScrub, endScrub]);
-
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-
-    const onPointerDownCapture = (e: PointerEvent) => {
-      if (e.button !== 0) return;
-      const target = e.target as HTMLElement;
-      if (target.closest('[data-playhead]') || target.closest('[data-trim-handle]')) return;
-      if (!isNearPlayheadX(e.clientX, el, playheadTime, pxPerSec)) return;
-      e.preventDefault();
-      e.stopPropagation();
-      beginScrub(e.clientX);
-    };
-
-    el.addEventListener('pointerdown', onPointerDownCapture, true);
-    return () => el.removeEventListener('pointerdown', onPointerDownCapture, true);
-  }, [playheadTime, pxPerSec, beginScrub]);
-
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-
-    const onPointerDown = (e: PointerEvent) => {
-      if (e.button !== 0) return;
-      const target = e.target as HTMLElement;
-      if (target.closest('[data-playhead]') || target.closest('[data-trim-handle]')) return;
-      pendingScrubRef.current = { startX: e.clientX, active: false };
-    };
-
-    const onPointerMove = (e: PointerEvent) => {
-      const pending = pendingScrubRef.current;
-      if (!pending || pending.active) return;
-      if (Math.abs(e.clientX - pending.startX) < 4) return;
-      pending.active = true;
-      beginScrub(e.clientX);
-      moveScrub(e.clientX);
-    };
-
-    const onPointerUp = () => {
-      const pending = pendingScrubRef.current;
-      if (pending?.active) {
-        endScrub();
-      }
-      pendingScrubRef.current = null;
-    };
-
-    el.addEventListener('pointerdown', onPointerDown);
-    window.addEventListener('pointermove', onPointerMove);
-    window.addEventListener('pointerup', onPointerUp);
-    return () => {
-      el.removeEventListener('pointerdown', onPointerDown);
-      window.removeEventListener('pointermove', onPointerMove);
-      window.removeEventListener('pointerup', onPointerUp);
-    };
-  }, [beginScrub, moveScrub, endScrub]);
-
-  useEffect(() => {
-    const max = slots.length > 0 ? totalDuration : scrubMaxDuration;
-    if (playheadTime > max) setPlayhead(max);
-  }, [totalDuration, scrubMaxDuration, playheadTime, slots.length, setPlayhead]);
-
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el || draggingPlayhead) return;
-    const playheadX = playheadTime * pxPerSec;
-    const margin = 80;
-    if (playheadX < el.scrollLeft + margin) {
-      el.scrollLeft = Math.max(0, playheadX - margin);
-    } else if (playheadX > el.scrollLeft + el.clientWidth - margin) {
-      el.scrollLeft = playheadX - el.clientWidth + margin;
-    }
-  }, [playheadTime, pxPerSec, draggingPlayhead]);
+  const {
+    playheadTime,
+    draggingPlayhead,
+    playheadLeft,
+    selectSlot,
+    seekTo,
+    beginScrub,
+    moveScrub,
+    endScrub,
+    handleTrackBgMouseDown,
+    timeFromClientX,
+    setPlayhead,
+  } = useTimelineScrub({
+    scrollRef,
+    pxPerSec,
+    clipLayouts,
+    subtitleLayouts,
+    magnet,
+    scrubMaxDuration,
+    totalDuration,
+    slotsLength: mainTimelineSlots.length,
+    controlledPlayhead,
+    onPlayheadChange,
+    onScrubStart,
+    onSlotSelect: selectSlotWithOverlayClear,
+    setSelectedTrackKey,
+  });
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -515,7 +396,6 @@ export default function Timeline({
     return () => el.removeEventListener('wheel', onWheel);
   }, []);
 
-  const playheadLeft = playheadTime * pxPerSec;
   const coverThumb =
     coverThumbProp || slots[0]?.template_thumbnail || slots[0]?.asset_thumbnail || '';
   const totalTracksHeight = activeTrackLayout.reduce((s, t) => s + t.height, 0);
@@ -548,6 +428,77 @@ export default function Timeline({
     );
   };
 
+  const renderTtsSegment = (layout: TtsSegmentLayout) => {
+    if (!isTrackContentVisible(trackControls, 'ttsVoice')) return null;
+    const locked = isTrackLocked(trackControls, 'ttsVoice');
+    const label =
+      layout.segment.status === 'generated'
+        ? String(layout.segment.voiceName || 'AI人声')
+        : layout.segment.status === 'failed'
+          ? '生成失败'
+          : '待生成';
+    return (
+      <div
+        key={`${layout.segment.id || layout.start}-tts`}
+        data-clip
+        className="absolute"
+        style={{
+          left: layout.left,
+          width: layout.width,
+          top: CLIP_INSET,
+          height: trackHeight('ttsVoice') - CLIP_INSET * 2,
+        }}
+      >
+        <CapCutAudioClip
+          seed={`${layout.segment.id || layout.start}-tts`}
+          width={layout.width}
+          label={label}
+          selected={selectedTrackKey === 'ttsVoice'}
+          locked={locked}
+          dimmed={isTrackMuted(trackControls, 'ttsVoice') || layout.segment.status !== 'generated'}
+          onClick={() => {
+            if (locked) return;
+            setSelectedTrackKey('ttsVoice');
+            seekTo(layout.start);
+          }}
+        />
+      </div>
+    );
+  };
+
+  const renderSubtitleClip = (layout: SubtitleClipLayout) => {
+    if (!isTrackContentVisible(trackControls, 'subtitle')) return null;
+    const locked = isTrackLocked(trackControls, 'subtitle');
+    const rawText = String(layout.clip.displayText || layout.clip.text || '').replace(/\n/g, ' ');
+    const text = rawText.length > 48 ? `${rawText.slice(0, 48)}…` : rawText;
+    return (
+      <div
+        key={`${layout.clip.id || layout.start}-${layout.start}-${text.slice(0, 8)}`}
+        data-clip
+        className="absolute"
+        style={{
+          left: layout.left,
+          width: layout.width,
+          top: CLIP_INSET,
+          height: trackHeight('subtitle') - CLIP_INSET * 2,
+        }}
+      >
+        <CapCutSubtitleClip
+          text={text}
+          selected={false}
+          locked={locked}
+          dimmed={isTrackMuted(trackControls, 'subtitle')}
+          subtitleAttention="none"
+          onClick={() => {
+            if (locked) return;
+            setSelectedTrackKey('subtitle');
+            seekTo(layout.start);
+          }}
+        />
+      </div>
+    );
+  };
+
   const renderSubtitleSegment = (layout: SegmentLayout) => {
     if (!isTrackContentVisible(trackControls, 'subtitle')) return null;
     const locked = isTrackLocked(trackControls, 'subtitle');
@@ -569,6 +520,7 @@ export default function Timeline({
           selected={layout.slot.id === selectedSlotId}
           locked={locked}
           dimmed={isTrackMuted(trackControls, 'subtitle')}
+          subtitleAttention={slotSubtitleAttentionLevel(layout.slot)}
           onClick={() => !locked && selectSlot(layout.slot.id)}
         />
       </div>
@@ -745,13 +697,26 @@ export default function Timeline({
                   (l.slot.matchedAssetId ? assetMap[l.slot.matchedAssetId]?.thumbnail : '') ||
                   '';
                 const segmentFile = l.slot.segment_file_path?.trim() || '';
-                const videoSrc = hasMatchedAsset
-                  ? segmentFile ||
-                    l.slot.asset_file_path ||
-                    (l.slot.matchedAssetId ? assetMap[l.slot.matchedAssetId]?.filePath : '') ||
-                    ''
-                  : templateVideoPath || '';
-                const clipStart = segmentFile ? 0 : (l.slot.clipStart ?? 0);
+                const templatePreviewSrc =
+                  templateProxyPaths.smooth ||
+                  templateProxyPaths.low ||
+                  templateProxyPaths.clear ||
+                  templateVideoPath ||
+                  '';
+                const videoSrc = hasMatchedAsset ? '' : templatePreviewSrc;
+                const clipStart = segmentFile
+                  ? 0
+                  : (l.slot.templateSourceStart ?? l.slot.clipStart ?? 0);
+                const slotSourceStart =
+                  l.slot.slotStart ?? l.slot.templateSourceStart ?? l.slot.clipStart ?? clipStart;
+                const slotSourceEnd =
+                  l.slot.slotEnd ?? slotSourceStart + Math.max(0.1, l.slot.duration);
+                const filmstripUrl =
+                  !hasMatchedAsset &&
+                  !timelineThumbnails.length &&
+                  !timelineThumbnailsLoading
+                    ? l.slot.filmstrip
+                    : undefined;
                 const locked = isTrackLocked(trackControls, 'video') || !!l.slot.locked;
                 const tags = l.slot.ai_tags?.length
                   ? l.slot.ai_tags.map((t) => (t.startsWith('#') ? t : `#${t}`)).join(' ')
@@ -769,8 +734,24 @@ export default function Timeline({
                   <CapCutVideoClip
                     slotId={l.slot.id}
                     thumb={thumb}
-                    videoSrc={videoSrc}
+                    videoSrc={
+                      hasMatchedAsset
+                        ? videoSrc
+                        : timelineThumbnails.length || timelineThumbnailsLoading
+                          ? ''
+                          : videoSrc
+                    }
                     clipStart={clipStart}
+                    slotSourceStart={hasMatchedAsset ? clipStart : slotSourceStart}
+                    slotSourceEnd={hasMatchedAsset ? clipStart + l.slot.duration : slotSourceEnd}
+                    filmstripUrl={filmstripUrl}
+                    filmstripFrames={l.slot.filmstripFrames}
+                    filmstripTileWidth={l.slot.filmstripTileWidth}
+                    timelineThumbnails={!hasMatchedAsset ? timelineThumbnails : undefined}
+                    timelineThumbnailsLoading={
+                      !hasMatchedAsset ? timelineThumbnailsLoading : false
+                    }
+                    sampleIntervalSec={sampleIntervalSec}
                     title={title}
                     tags={tags}
                     duration={l.slot.duration}
@@ -778,6 +759,7 @@ export default function Timeline({
                     selected={selected}
                     locked={locked}
                     dimmed={isTrackMuted(trackControls, 'video')}
+                    subtitleAttention={slotSubtitleAttentionLevel(l.slot)}
                     pxPerSec={pxPerSec}
                     onTrimStart={(deltaPx, pps) => onTrimSlot?.(l.slot.id, 'start', deltaPx / pps)}
                     onTrimEnd={(deltaPx, pps) => onTrimSlot?.(l.slot.id, 'end', deltaPx / pps)}
@@ -801,18 +783,6 @@ export default function Timeline({
                 );
               })
             )}
-            {clipLayouts.length > 1
-              ? clipLayouts.slice(1).map((layout) => (
-                  <div
-                    key={`join-${layout.slot.id}`}
-                    className="pointer-events-none absolute top-0 z-[3] w-px bg-[#face15]/25"
-                    style={{
-                      left: layout.left,
-                      height: trackHeight('video'),
-                    }}
-                  />
-                ))
-              : null}
           </>
         );
 
@@ -969,25 +939,31 @@ export default function Timeline({
           : null;
 
       case 'subtitle':
+        if (subtitleClips.length > 0) {
+          return subtitleClipLayouts.length > 0 ? (
+            subtitleClipLayouts.map(renderSubtitleClip)
+          ) : (
+            <LaneDropHint text="字幕片段加载中…" />
+          );
+        }
         return subtitleLayouts.length > 0 ? (
           subtitleLayouts.map(renderSubtitleSegment)
-        ) : slots.length > 0 ? (
-          <LaneDropHint text="在「字幕」侧栏或属性面板编辑字幕" />
-        ) : null;
+        ) : hasSubtitleOnTimeline ? (
+          <LaneDropHint text="字幕加载中…" />
+        ) : (
+          <LaneDropHint text="点击「识别字幕」生成剪映式字幕轨" />
+        );
+
+      case 'ttsVoice':
+        return ttsSegmentLayouts.length > 0 ? (
+          ttsSegmentLayouts.map(renderTtsSegment)
+        ) : (
+          <LaneDropHint text="生成 AI 人声后显示音频轨" />
+        );
 
       case 'audio':
         return slots.length > 0 ? (
           <>
-            {beatMarkers.map((t, i) => (
-              <div
-                key={`audio-beat-${i}-${t}`}
-                className="pointer-events-none absolute top-0 z-[2] w-px bg-[#face15]/35"
-                style={{
-                  left: t * pxPerSec,
-                  height: trackHeight('audio'),
-                }}
-              />
-            ))}
             {sfxMarkers.map((marker, i) => (
               <div
                 key={`audio-sfx-${i}-${marker.time}`}
@@ -1272,21 +1248,6 @@ export default function Timeline({
                 </div>
               );
             })}
-
-            {beatMarkers.length > 0
-              ? beatMarkers.map((t, i) => (
-                  <div
-                    key={`beat-${i}-${t}`}
-                    className="pointer-events-none absolute top-0 z-[4] w-px"
-                    style={{
-                      left: t * pxPerSec,
-                      height: RULER_H + totalTracksHeight,
-                      background:
-                        'linear-gradient(to bottom, rgba(250,206,21,0.55) 0%, rgba(250,206,21,0.15) 100%)',
-                    }}
-                  />
-                ))
-              : null}
 
             <TimelinePlayhead
               left={playheadLeft}

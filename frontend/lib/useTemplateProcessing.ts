@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { apiHeaders, apiUrl } from '@/lib/api';
+import { templateStatusPollMs } from '@/lib/deviceProfile';
 import type { PreviewProxyPaths } from '@/lib/previewSettings';
 
 export type TemplateAiVision = {
@@ -23,6 +24,14 @@ export type TemplateProcessingState = {
   sfxMarkers: import('@/lib/slotEdit').SfxMarker[];
   slotCount: number;
   slotsAiReadyCount: number;
+  slotsSubtitleReadyCount: number;
+  subtitleBatchRunning: boolean;
+  subtitleRecognitionMode: string;
+  subtitleEmptyCount: number;
+  subtitleLowCount: number;
+  subtitleDuplicateCount: number;
+  subtitleProgressLabel: string;
+  aiUnderstandingReady: boolean;
   aiVision: TemplateAiVision;
   duration: number;
   proxyPaths: PreviewProxyPaths;
@@ -41,6 +50,14 @@ export function useTemplateProcessing(templateId: string | null) {
     sfxMarkers: [],
     slotCount: 0,
     slotsAiReadyCount: 0,
+    slotsSubtitleReadyCount: 0,
+    subtitleBatchRunning: false,
+    subtitleRecognitionMode: 'fast',
+    subtitleEmptyCount: 0,
+    subtitleLowCount: 0,
+    subtitleDuplicateCount: 0,
+    subtitleProgressLabel: '',
+    aiUnderstandingReady: true,
     aiVision: {},
     duration: 0,
     proxyPaths: {},
@@ -57,6 +74,7 @@ export function useTemplateProcessing(templateId: string | null) {
       if (!resp.ok) return;
       const enhanceStatus = data.enhance_status || 'ready';
       const processingStatus = data.processing_status || 'ready';
+      const subtitleBatchRunning = !!data.subtitle_batch_running;
       setState({
         status: processingStatus,
         progress: Number(data.processing_progress ?? 100),
@@ -69,13 +87,22 @@ export function useTemplateProcessing(templateId: string | null) {
         sfxMarkers: Array.isArray(data.sfx_markers) ? data.sfx_markers : [],
         slotCount: Number(data.slot_count ?? 0),
         slotsAiReadyCount: Number(data.slots_ai_ready_count ?? 0),
+        slotsSubtitleReadyCount: Number(data.slots_subtitle_ready_count ?? 0),
+        subtitleBatchRunning,
+        subtitleRecognitionMode: String(data.subtitle_recognition_mode || 'fast'),
+        subtitleEmptyCount: Number(data.subtitle_empty_count ?? 0),
+        subtitleLowCount: Number(data.subtitle_low_count ?? 0),
+        subtitleDuplicateCount: Number(data.subtitle_duplicate_count ?? 0),
+        subtitleProgressLabel: String(data.subtitle_progress_label || ''),
+        aiUnderstandingReady: data.ai_understanding_ready !== false,
         aiVision: (data.ai_vision as TemplateAiVision) || {},
         duration: Number(data.duration ?? 0),
         proxyPaths: (data.proxy_paths as PreviewProxyPaths) || {},
       });
-      const done =
+      const processingDone =
         (processingStatus === 'ready' || processingStatus === 'failed') &&
         (enhanceStatus === 'ready' || enhanceStatus === 'failed');
+      const done = processingDone && !subtitleBatchRunning;
       if (done) {
         if (timerRef.current) clearInterval(timerRef.current);
         timerRef.current = null;
@@ -100,6 +127,14 @@ export function useTemplateProcessing(templateId: string | null) {
         sfxMarkers: [],
         slotCount: 0,
         slotsAiReadyCount: 0,
+        slotsSubtitleReadyCount: 0,
+        subtitleBatchRunning: false,
+        subtitleRecognitionMode: 'fast',
+        subtitleEmptyCount: 0,
+        subtitleLowCount: 0,
+        subtitleDuplicateCount: 0,
+        subtitleProgressLabel: '',
+        aiUnderstandingReady: true,
         aiVision: {},
         duration: 0,
         proxyPaths: {},
@@ -113,7 +148,8 @@ export function useTemplateProcessing(templateId: string | null) {
       enhanceStatus: 'processing',
     }));
     void poll();
-    timerRef.current = setInterval(poll, 1500);
+    const pollMs = templateStatusPollMs();
+    timerRef.current = setInterval(poll, pollMs);
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
     };

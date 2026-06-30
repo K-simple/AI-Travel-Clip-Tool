@@ -5,12 +5,14 @@ import type { DragEvent } from 'react';
 import CloudLibraryPanel from '@/components/CloudLibraryPanel';
 import MarketplacePanel from '@/components/MarketplacePanel';
 import TemplateLibraryPanel from '@/components/TemplateLibraryPanel';
-import SubtitleLibraryPanel from '@/components/SubtitleLibraryPanel';
+import SubtitleLibraryPanel, { type SpokenCaptionSegment } from '@/components/SubtitleLibraryPanel';
 import AudioLibraryPanel from '@/components/AudioLibraryPanel';
+import EffectsLibraryPanel from '@/components/EffectsLibraryPanel';
 import { toMediaUrl } from '@/lib/api';
 import type { PreviewProxyPaths } from '@/lib/previewSettings';
 import type { TemplateSlot } from '@/lib/timeline';
 import { getVideoFilesFromDataTransfer, isVideoFile } from '@/lib/timelineDrop';
+import { ENABLE_EXAMPLE_LIBS } from '@/lib/featureFlags';
 
 export type VideoSegment = {
   segment_id: string;
@@ -63,10 +65,31 @@ type AssetLibraryProps = {
   templateAudioUrl?: string;
   onToggleTemplateMusic?: () => void;
   onToggleSlotOriginalAudio?: (slotId: string) => void;
-  onBatchRecognizeSubtitles?: () => void;
+  onRecognizeAllSubtitles?: () => void;
+  onApplyCaptionSlots?: () => void;
+  onApplyVisualSceneSlots?: () => void;
+  applyingCaptionSlots?: boolean;
+  onGenerateTts?: () => void;
+  onAlignTimelineToTts?: () => void;
+  generatingTts?: boolean;
+  aligningTimeline?: boolean;
+  voiceProfiles?: Array<{ voiceId?: string; displayName?: string }>;
+  selectedVoiceId?: string;
+  onVoiceChange?: (voiceId: string) => void;
+  ttsSegments?: import('@/lib/timeline').TtsSegment[];
+  onUpdateSubtitleClip?: (index: number, patch: Partial<import('@/lib/timeline').SubtitleClip>) => void;
   recognizingAllSubtitles?: boolean;
+  recognizeProgress?: string;
+  subtitleMode?: 'speech' | 'burned';
+  onSubtitleModeChange?: (mode: 'speech' | 'burned') => void;
+  spokenCaptions?: SpokenCaptionSegment[];
+  subtitleClips?: import('@/lib/timeline').SubtitleClip[];
+  recognitionDebug?: Record<string, unknown> | null;
   onRecognizeSlotSubtitle?: () => void;
   recognizingSlotSubtitle?: boolean;
+  onApplyEffectPresets?: (slots: TemplateSlot[]) => void;
+  onAnalyzeTemplateEffects?: () => void;
+  analyzingTemplateEffects?: boolean;
   onTemplateLibrarySelect?: (templateId: string) => void;
   onTemplateLibraryImported?: (templateId: string) => void;
   onTemplateLibraryDeleted?: (templateId: string) => void;
@@ -76,9 +99,14 @@ const SIDEBAR_ITEMS = [
   { id: 'import', label: '导入', icon: 'upload' },
   { id: 'templates', label: '模板库', icon: 'template' },
   { id: 'media', label: '素材', icon: 'media' },
-  { id: 'cloud', label: '云库', icon: 'cloud' },
-  { id: 'market', label: '市场', icon: 'market' },
+  ...(ENABLE_EXAMPLE_LIBS
+    ? ([
+        { id: 'cloud', label: '示例素材', icon: 'cloud' },
+        { id: 'market', label: '示例模板', icon: 'market' },
+      ] as const)
+    : []),
   { id: 'subtitle', label: '字幕', icon: 'text' },
+  { id: 'effects', label: '特效', icon: 'effects' },
   { id: 'audio', label: '音频', icon: 'audio' },
 ] as const;
 
@@ -123,6 +151,12 @@ function SidebarIcon({ name }: { name: (typeof SIDEBAR_ITEMS)[number]['icon'] })
       return (
         <svg className={cls} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
           <path d="M6 6h12M12 6v14M9 20h6" strokeLinecap="round" />
+        </svg>
+      );
+    case 'effects':
+      return (
+        <svg className={cls} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+          <path d="M12 3l2.2 6.8H21l-5.5 4 2.1 6.7L12 16.5 6.4 20.5l2.1-6.7L3 9.8h6.8L12 3z" strokeLinejoin="round" />
         </svg>
       );
     case 'audio':
@@ -335,10 +369,31 @@ export default function AssetLibrary({
   templateAudioUrl = '',
   onToggleTemplateMusic,
   onToggleSlotOriginalAudio,
-  onBatchRecognizeSubtitles,
+  onRecognizeAllSubtitles,
+  onApplyCaptionSlots,
+  onApplyVisualSceneSlots,
+  applyingCaptionSlots = false,
+  onGenerateTts,
+  onAlignTimelineToTts,
+  generatingTts = false,
+  aligningTimeline = false,
+  voiceProfiles = [],
+  selectedVoiceId = 'real_blog_female',
+  onVoiceChange,
+  ttsSegments = [],
+  onUpdateSubtitleClip,
   recognizingAllSubtitles = false,
+  recognizeProgress = '',
+  subtitleMode = 'speech',
+  onSubtitleModeChange,
+  spokenCaptions = [],
+  subtitleClips = [],
+  recognitionDebug = null,
   onRecognizeSlotSubtitle,
   recognizingSlotSubtitle = false,
+  onApplyEffectPresets,
+  onAnalyzeTemplateEffects,
+  analyzingTemplateEffects = false,
   onTemplateLibrarySelect,
   onTemplateLibraryImported,
   onTemplateLibraryDeleted,
@@ -614,12 +669,12 @@ export default function AssetLibrary({
           {!selectMode ? (
             <label className="cursor-pointer rounded bg-[#face15] px-2.5 py-1 text-xs font-medium text-black hover:bg-[#ffe066]">
               + 上传
-              <input
-                type="file"
-                accept="video/*"
+          <input
+            type="file"
+            accept="video/*"
                 className="hidden"
                 multiple={options.multiple}
-                onChange={(e) => {
+            onChange={(e) => {
                   const picked = Array.from(e.target.files || []).filter(isVideoFile);
                   if (!picked.length) return;
                   if (importAsTemplate && hasTemplate) {
@@ -627,9 +682,9 @@ export default function AssetLibrary({
                   }
                   handleFilesImport(picked);
                   e.target.value = '';
-                }}
-              />
-            </label>
+            }}
+          />
+        </label>
           ) : null}
         </div>
       </div>
@@ -637,7 +692,7 @@ export default function AssetLibrary({
       {selectMode && options.showMultiSelect ? (
         <div className="border-b border-[#2e2e2e] px-3 py-1.5 text-[10px] text-[#888]">
           点击素材卡片勾选，已选 {selectedIds.size} 项
-        </div>
+                  </div>
       ) : null}
 
       {options.showSearch ? (
@@ -648,7 +703,7 @@ export default function AssetLibrary({
             placeholder="搜索素材"
             className="ui-input"
           />
-        </div>
+              </div>
       ) : null}
 
       {loading ? <div className="px-3 text-xs text-[#8b8b8b]">正在上传…</div> : null}
@@ -658,20 +713,20 @@ export default function AssetLibrary({
           <div className="pointer-events-none absolute inset-2 z-10 flex flex-col items-center justify-center rounded-lg border-2 border-dashed border-[#face15] bg-[#face15]/10">
             <span className="text-sm text-[#face15]">{options.dropHint}</span>
             <span className="mt-1 text-[10px] text-[#8b8b8b]">支持 mp4 / mov / mkv 等</span>
-          </div>
+                  </div>
         ) : null}
 
         {!options.showAssetGrid || gridItems.length === 0 ? (
           <div className="col-span-2 flex flex-col items-center justify-center py-10 text-center text-xs text-[#666]">
             <p>{options.emptyPrimary}</p>
             <p className="mt-1 text-[#555]">{options.emptySecondary}</p>
-          </div>
+                </div>
         ) : (
           renderAssetGridItems()
         )}
-      </div>
-    </div>
-  );
+              </div>
+            </div>
+          );
 
   return (
     <div className="ui-panel flex h-full min-h-0 w-full min-w-0 border-r border-editor-border">
@@ -692,7 +747,7 @@ export default function AssetLibrary({
         ))}
       </nav>
 
-      <div className="flex min-w-0 flex-1 flex-col">
+      <div className="flex min-w-0 flex-1 flex-col min-h-0 overflow-hidden">
         {activeTab === 'cloud' ? <CloudLibraryPanel onImported={onAssetsRefresh} /> : null}
         {activeTab === 'templates' ? (
           <TemplateLibraryPanel
@@ -706,17 +761,50 @@ export default function AssetLibrary({
           <MarketplacePanel templateId={templateId} onInstalled={onTemplateInstalled} />
         ) : null}
         {activeTab === 'subtitle' ? (
-          <SubtitleLibraryPanel
+          <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+            <SubtitleLibraryPanel
             slots={slots}
             selectedSlotId={selectedSlotId}
             onSelectSlot={(id) => onSelectSlot?.(id)}
             onUpdateSubtitle={(id, text) => onUpdateSlotSubtitle?.(id, text)}
-            onBatchRecognize={onBatchRecognizeSubtitles}
+            onRecognizeAll={onRecognizeAllSubtitles}
+            onApplyCaptionSlots={onApplyCaptionSlots}
+            onApplyVisualSceneSlots={onApplyVisualSceneSlots}
+            applyingCaptionSlots={applyingCaptionSlots}
+            onGenerateTts={onGenerateTts}
+            onAlignTimelineToTts={onAlignTimelineToTts}
+            generatingTts={generatingTts}
+            aligningTimeline={aligningTimeline}
+            voiceProfiles={voiceProfiles}
+            selectedVoiceId={selectedVoiceId}
+            onVoiceChange={onVoiceChange}
+            ttsSegments={ttsSegments}
+            onUpdateSubtitleClip={onUpdateSubtitleClip}
             onRecognizeSelected={onRecognizeSlotSubtitle}
-            batchRecognizing={recognizingAllSubtitles}
+            recognizingAll={recognizingAllSubtitles}
             recognizingSelected={recognizingSlotSubtitle}
+            recognizeProgress={recognizeProgress}
+            subtitleMode={subtitleMode}
+            onSubtitleModeChange={onSubtitleModeChange}
+            spokenCaptions={spokenCaptions}
+            subtitleClips={subtitleClips}
+            recognitionDebug={recognitionDebug}
             disabled={!templateId}
           />
+          </div>
+        ) : null}
+        {activeTab === 'effects' ? (
+          <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+          <EffectsLibraryPanel
+            slots={slots}
+            selectedSlotId={selectedSlotId}
+            onSelectSlot={(id) => onSelectSlot?.(id)}
+            onApplyPreset={(updated) => onApplyEffectPresets?.(updated)}
+            onAnalyzeTemplateEffects={onAnalyzeTemplateEffects}
+            analyzingEffects={analyzingTemplateEffects}
+            disabled={!templateId}
+          />
+          </div>
         ) : null}
         {activeTab === 'audio' ? (
           <AudioLibraryPanel

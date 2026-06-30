@@ -14,6 +14,8 @@ class MatchStrategy:
     transition_inherit: bool = True
     use_vector_match: bool = True
     vector_weight: float = 0.25
+    semantic_weight: float = 0.4
+    min_match_score: float = 0.38
 
     @classmethod
     def from_dict(cls, data: Optional[Dict[str, Any]]) -> "MatchStrategy":
@@ -28,6 +30,8 @@ class MatchStrategy:
             transition_inherit=bool(data.get("transition_inherit", True)),
             use_vector_match=bool(data.get("use_vector_match", True)),
             vector_weight=float(data.get("vector_weight", 0.25)),
+            semantic_weight=float(data.get("semantic_weight", 0.4)),
+            min_match_score=float(data.get("min_match_score", 0.38)),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -40,6 +44,8 @@ class MatchStrategy:
             "transition_inherit": self.transition_inherit,
             "use_vector_match": self.use_vector_match,
             "vector_weight": self.vector_weight,
+            "semantic_weight": self.semantic_weight,
+            "min_match_score": self.min_match_score,
         }
 
     def merge_settings(self, settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -50,6 +56,8 @@ class MatchStrategy:
             "transition_inherit": self.transition_inherit,
             "use_vector_match": self.use_vector_match,
             "vector_weight": self.vector_weight,
+            "semantic_weight": self.semantic_weight,
+            "min_match_score": self.min_match_score,
         }
         if settings:
             base.update(settings)

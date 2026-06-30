@@ -11,6 +11,8 @@ export type TimelineTrackDef = {
 
 /** 全部可选轨道（用户通过「添加轨道」按需启用） */
 export const ALL_TRACK_LAYOUT: ReadonlyArray<TimelineTrackDef> = [
+  { key: 'subtitle', label: '字幕', height: 36, group: 'text', addLabel: '字幕轨' },
+  { key: 'ttsVoice', label: 'AI人声', height: 34, group: 'audio', addLabel: 'AI人声轨' },
   { key: 'video', label: '主视频', height: 88, group: 'video', addLabel: '视频轨' },
   { key: 'overlay', label: '特效', height: 32, group: 'effect', addLabel: '特效轨' },
   { key: 'sticker', label: '贴纸', height: 32, group: 'effect', addLabel: '贴纸轨' },
@@ -18,13 +20,17 @@ export const ALL_TRACK_LAYOUT: ReadonlyArray<TimelineTrackDef> = [
   { key: 'filter', label: '滤镜', height: 26, group: 'meta', addLabel: '滤镜轨' },
   { key: 'transition', label: '转场', height: 26, group: 'meta', addLabel: '转场轨' },
   { key: 'adjust', label: '调节', height: 26, group: 'meta', addLabel: '调节轨' },
-  { key: 'subtitle', label: '文本', height: 32, group: 'text', addLabel: '文本轨' },
   { key: 'audio', label: '音乐', height: 34, group: 'audio', addLabel: '音乐轨' },
   { key: 'audioVoice', label: '原声', height: 34, group: 'audio', addLabel: '原声轨' },
 ];
 
-/** 默认仅展示主视频轨 */
-export const DEFAULT_VISIBLE_TRACK_KEYS: TrackKey[] = ['video'];
+/** 默认展示字幕轨 + AI人声 + 主视频 */
+export const DEFAULT_VISIBLE_TRACK_KEYS: TrackKey[] = ['subtitle', 'ttsVoice', 'video'];
+
+/** 有字幕内容时确保字幕轨已启用 */
+export function ensureSubtitleTrackVisible(keys: TrackKey[]): TrackKey[] {
+  return sortTrackKeys([...keys, 'subtitle', 'ttsVoice']);
+}
 
 const ORDER = ALL_TRACK_LAYOUT.map((t) => t.key);
 

@@ -7,6 +7,8 @@ export type MatchStrategy = {
   transition_inherit: boolean;
   use_vector_match: boolean;
   vector_weight: number;
+  semantic_weight: number;
+  min_match_score: number;
 };
 
 export const DEFAULT_MATCH_STRATEGY: MatchStrategy = {
@@ -18,6 +20,8 @@ export const DEFAULT_MATCH_STRATEGY: MatchStrategy = {
   transition_inherit: true,
   use_vector_match: true,
   vector_weight: 0.25,
+  semantic_weight: 0.4,
+  min_match_score: 0.38,
 };
 
 export function strategyToSettings(strategy: MatchStrategy) {
@@ -28,5 +32,7 @@ export function strategyToSettings(strategy: MatchStrategy) {
     transition_inherit: strategy.transition_inherit,
     use_vector_match: strategy.use_vector_match,
     vector_weight: strategy.vector_weight,
+    semantic_weight: strategy.semantic_weight,
+    min_match_score: strategy.min_match_score,
   };
 }

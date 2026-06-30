@@ -8,18 +8,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from services.effects_engine import compile_clip_filters
 from services.transitions import resolve_transition
+from services.subtitle_render import build_ass_from_timeline_slots, make_template_subtitle_if_needed, write_ass
 from services.video_exporter import (
     add_template_audio,
-    build_ass_from_timeline_slots,
     burn_subtitles,
     cut_asset_clip,
     ensure_ffmpeg,
     file_ok,
     has_audio_stream,
-    make_template_subtitle_if_needed,
     run_cmd,
     select_template_audio_source,
-    write_ass,
 )
 from utils.security import resolve_storage_path
 

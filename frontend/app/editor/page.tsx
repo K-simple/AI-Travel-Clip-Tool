@@ -8,20 +8,18 @@ import { useEditorPanelSizes } from '@/components/editor/useEditorPanelSizes';
 import PreviewPanel from '@/components/PreviewPanel';
 import PropertiesPanel, { type MatchWeights } from '@/components/PropertiesPanel';
 import Toolbar from '@/components/Toolbar';
-import { apiHeaders, apiUrl, formatApiDetail, longRunningApiUrl, readApiJson, SUBTITLE_BATCH_CHUNK_SIZE, toMediaUrl } from '@/lib/api';
+import { apiHeaders, apiUrl, formatApiDetail, longRunningApiUrl, readApiJson, toMediaUrl } from '@/lib/api';
 import {
   DEFAULT_ASSET_PANEL_WIDTH,
   DEFAULT_PLAYER_PANEL_WIDTH,
   DEFAULT_TIMELINE_PANEL_HEIGHT,
 } from '@/lib/editorLayout';
-import { getSlotSourceTimeRange, getSlotSourceTimeRangeById, splitSlotAtTime, type SfxMarker } from '@/lib/slotEdit';
+import { getSlotSourceTimeRange, getSlotSourceTimeRangeById, splitSlotAtTime, syncSubtitleTextUpdate, type SfxMarker } from '@/lib/slotEdit';
 import {
   applyAssetToSlot,
-  slotsToTimeline,
   timelineToSlots,
   type TemplateSlot,
 } from '@/lib/timeline';
-import { snapToFrame } from '@/lib/timelineLayout';
 import {
   findFirstEmptySlotId,
   findSlotIdAtTime,
@@ -32,92 +30,44 @@ import {
   DEFAULT_TRACK_CONTROLS,
   describeTrackToggle,
   isTrackLocked,
-  mergeTrackControls,
   type TrackControls,
   type TrackKey,
   toggleTrackControl,
 } from '@/lib/trackControls';
 import {
   clampTrackHeight,
-  embedTrackHeights,
-  extractTrackHeights,
   getDefaultTrackHeight,
   type TrackHeightMap,
 } from '@/lib/trackHeights';
 import {
   DEFAULT_MATCH_STRATEGY,
-  strategyToSettings,
   type MatchStrategy,
 } from '@/lib/matchStrategy';
 import { rippleClearRight, rippleDeleteSlot, trimClipDuration, trimClipStart, moveSlotById, reorderSlots } from '@/lib/slotOps';
 import { useTemplateProcessing } from '@/lib/useTemplateProcessing';
+import { useMatchFlow } from '@/lib/useMatchFlow';
+import { useSubtitleFlow } from '@/lib/useSubtitleFlow';
 import { useAssetProcessingPoll } from '@/lib/useAssetProcessing';
-import { uploadAssetWithProgress, uploadTemplateWithProgress } from '@/lib/uploadAsset';
+import { useAssetUpload } from '@/lib/useAssetUpload';
+import { useTemplateFlow } from '@/lib/useTemplateFlow';
 import type { PreviewProxyPaths } from '@/lib/previewSettings';
 import { useSlotHistory } from '@/lib/useSlotHistory';
 import {
   createOverlayClip,
-  overlayTracksToPayload,
-  parseOverlayTracksFromEdl,
   type OverlayTracks,
 } from '@/lib/edlModel';
 import ProjectListModal from '@/components/ProjectListModal';
 import OnboardingGuide from '@/components/OnboardingGuide';
 import GlobalStatusBar, { type GlobalStatusItem } from '@/components/GlobalStatusBar';
-import { buildExportPayload } from '@/lib/exportSettings';
-import {
-  buildExportPrecheck,
-  formatExportPrecheckDialog,
-} from '@/lib/exportPrecheck';
-import { formatExportError } from '@/lib/formatExportError';
+import { useProjectPersistence } from '@/lib/useProjectPersistence';
+import { useExportFlow } from '@/lib/useExportFlow';
+import { useAssetList, type Asset, formatAssetDuration } from '@/lib/useAssetList';
+import { useEditorPlayback } from '@/lib/useEditorPlayback';
+import { formatExportPrecheckDialog } from '@/lib/exportPrecheck';
 import { computeOnboardingState, type OnboardingStepId } from '@/lib/onboardingSteps';
-import {
-  exportCapCutDraftSync,
-  fetchCapCutStatus,
-  fetchCapCutStatusWithRetry,
-  guessMediaBaseUrl,
-  installAndOpenCapCutDraft,
-  pollCapCutExportTask,
-  type CapCutExportResult,
-  type CapCutMateStatus,
-} from '@/lib/capcutExport';
-
-type VideoSegment = {
-  segment_id: string;
-  start: number;
-  end: number;
-  duration: number;
-  thumbnail?: string;
-  segment_file_path?: string;
-  file_path?: string;
-  type?: string;
-};
-
-type Asset = {
-  id: string;
-  title: string;
-  filename?: string;
-  duration: string;
-  durationSeconds: number;
-  tags: string[];
-  filePath: string;
-  proxyPath?: string;
-  proxyPaths?: PreviewProxyPaths;
-  thumbnail?: string;
-  segments?: VideoSegment[];
-  segmentCount?: number;
-  processingStatus?: 'processing' | 'ready' | 'failed';
-  processingProgress?: number;
-};
-
-const formatDuration = (seconds: number) => {
-  const m = Math.floor(seconds / 60);
-  const s = Math.round(seconds % 60);
-  return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-};
 
 export default function EditorPage() {
-  const [assets, setAssets] = useState<Asset[]>([]);
+  const { assets, setAssets, loadAssets } = useAssetList({ autoLoad: false });
   const {
     slots,
     setSlots,
@@ -128,6 +78,20 @@ export default function EditorPage() {
     canRedo,
     resetHistory,
   } = useSlotHistory([]);
+  const totalDuration = useMemo(() => getTotalDuration(slots), [slots]);
+  const {
+    playheadTime,
+    setPlayheadTime,
+    isPlaying,
+    setIsPlaying,
+    playheadRef,
+    playStartRef,
+    playRafRef,
+    handlePlayheadStep,
+    handleTogglePlay,
+    handlePlayheadChange,
+    handleScrubStart,
+  } = useEditorPlayback(totalDuration);
   const [selectedSlotId, setSelectedSlotId] = useState<string>('');
   const [templateMusicEnabled, setTemplateMusicEnabled] = useState(true);
   const [templateId, setTemplateId] = useState<string | null>(null);
@@ -135,26 +99,12 @@ export default function EditorPage() {
   const [projectId, setProjectId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [uploadingCount, setUploadingCount] = useState(0);
-  const [savingProject, setSavingProject] = useState(false);
-  const [loadingProject, setLoadingProject] = useState(false);
-  const [matching, setMatching] = useState(false);
   const [recognizingSubtitle, setRecognizingSubtitle] = useState(false);
-  const [matchMessage, setMatchMessage] = useState<string>('');
-  const [matchError, setMatchError] = useState<string>('');
   const [matchWeights, setMatchWeights] = useState<MatchWeights>({
     tags_weight: 0.35,
     visual_weight: 0.35,
     duration_tolerance: 2.0,
   });
-  const [exportUrl, setExportUrl] = useState<string | null>(null);
-  const [exportStatus, setExportStatus] = useState<string>('');
-  const [exporting, setExporting] = useState(false);
-  const [exportError, setExportError] = useState<string>('');
-  const [playheadTime, setPlayheadTime] = useState(0);
-  const [isPlaying, setIsPlaying] = useState(false);
-  const playRafRef = useRef<number | null>(null);
-  const playStartRef = useRef({ wall: 0, time: 0 });
-  const playheadRef = useRef(0);
   const [trackControls, setTrackControls] = useState<Record<TrackKey, TrackControls>>(
     DEFAULT_TRACK_CONTROLS
   );
@@ -189,45 +139,14 @@ export default function EditorPage() {
   });
   const lastEnhanceStatusRef = useRef<string>('ready');
   const lastSlotsAiReadyCountRef = useRef(0);
+  const lastSubtitleBatchRunningRef = useRef(false);
   const [trackControlMessage, setTrackControlMessage] = useState('');
   const trackControlTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [overlayTracks, setOverlayTracks] = useState<OverlayTracks>({ v2: [], v3: [] });
-  const [exportResolution, setExportResolution] = useState('1080x1920');
-  const [addSubtitles, setAddSubtitles] = useState(true);
-  const [exportProgress, setExportProgress] = useState(0);
-  const [capCutDraftUrl, setCapCutDraftUrl] = useState<string | null>(null);
-  const [capCutExporting, setCapCutExporting] = useState(false);
-  const [capCutExportProgress, setCapCutExportProgress] = useState(0);
-  const [capCutStatus, setCapCutStatus] = useState('');
-  const [capCutReplaceableMode, setCapCutReplaceableMode] = useState(false);
-  const [capCutMateStatus, setCapCutMateStatus] = useState<CapCutMateStatus | null>(null);
   const [projectListOpen, setProjectListOpen] = useState(false);
   const [coverThumbnail, setCoverThumbnail] = useState('');
-  const [recognizingAllSubtitles, setRecognizingAllSubtitles] = useState(false);
+  const [analyzingTemplateEffects, setAnalyzingTemplateEffects] = useState(false);
   const templateFileInputRef = useRef<HTMLInputElement>(null);
-  const skipAutosaveRef = useRef(true);
-  const autosaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const saveProjectRef = useRef<() => Promise<boolean>>(async () => false);
-  const [autosaveStatus, setAutosaveStatus] = useState<
-    'idle' | 'pending' | 'saving' | 'saved' | 'error'
-  >('idle');
-
-  const refreshCapCutMateStatus = useCallback(async () => {
-    const status = await fetchCapCutStatusWithRetry(2, 300);
-    setCapCutMateStatus(status);
-    if (status?.ready) {
-      setCapCutStatus((prev) =>
-        prev.includes('剪映小助手未连接') || prev.includes('剪映小助手未就绪') ? '' : prev
-      );
-    }
-    return status;
-  }, []);
-
-  useEffect(() => {
-    void refreshCapCutMateStatus();
-    const timer = setInterval(() => void refreshCapCutMateStatus(), 8000);
-    return () => clearInterval(timer);
-  }, [refreshCapCutMateStatus]);
 
   useEffect(() => {
     if (templateProcessing.beatMarkers.length) {
@@ -277,13 +196,6 @@ export default function EditorPage() {
       }
     }
   }, [templateId, templateProcessing.status, templateProcessing.progress]);
-
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      skipAutosaveRef.current = false;
-    }, 2500);
-    return () => clearTimeout(timer);
-  }, []);
 
   const refreshProjectTimelineFromTemplate = useCallback(async () => {
     if (!projectId) return;
@@ -385,8 +297,187 @@ export default function EditorPage() {
     [assets]
   );
 
+  const {
+    loadingProject,
+    savingProject,
+    autosaveStatus,
+    setAutosaveStatus,
+    loadProject,
+    saveProject,
+    createProjectFromTemplate,
+    pauseAutosave,
+  } = useProjectPersistence({
+    projectId,
+    setProjectId,
+    setTemplateId,
+    slots,
+    replaceSlots,
+    resetHistory,
+    setSelectedSlotId,
+    assetMap,
+    trackControls,
+    trackHeights,
+    matchStrategy,
+    overlayTracks,
+    coverThumbnail,
+    setTemplateName,
+    setCoverThumbnail,
+    setTemplateAudioPath,
+    setTemplateVideoPath,
+    setTemplateProxyPaths,
+    setBeatMarkers,
+    setSfxMarkers,
+    setMatchStrategy,
+    setTrackControls,
+    setTrackHeights,
+    setOverlayTracks,
+  });
+
+  useEffect(() => {
+    loadAssets();
+    const params = new URLSearchParams(window.location.search);
+    const id = params.get('project_id');
+    if (id) {
+      void loadProject(id);
+    }
+  }, [loadAssets, loadProject]);
+
+  const {
+    matching,
+    matchMessage,
+    matchError,
+    runAutoMatch,
+  } = useMatchFlow({
+    projectId,
+    templateId,
+    slots,
+    assets,
+    matchStrategy,
+    matchWeights,
+    saveProject,
+    setSlots,
+    setIsPlaying,
+  });
+
+  const {
+    recognizingAllSubtitles,
+    recognizeProgress,
+    subtitleMode,
+    setSubtitleMode,
+    spokenCaptions,
+    subtitleClips,
+    recognitionDebug,
+    ttsSegments,
+    voiceProfiles,
+    selectedVoiceId,
+    setSelectedVoiceId,
+    generatingTts,
+    aligningTimeline,
+    runRecognizeAll,
+    applyCaptionSlots,
+    applyVisualSceneSlots,
+    generateTts,
+    alignTimelineToTts,
+    applyingCaptionSlots,
+    updateSubtitleClipAt,
+  } = useSubtitleFlow({
+    templateId,
+    slots,
+    setSlots,
+    onAfterAiSplit: refreshProjectTimelineFromTemplate,
+  });
+
+  const handleRecognizeAllSubtitles = () => runRecognizeAll();
+
+  const {
+    exportUrl,
+    exportStatus,
+    exporting,
+    exportError,
+    exportResolution,
+    setExportResolution,
+    addSubtitles,
+    setAddSubtitles,
+    exportProgress,
+    capCutDraftUrl,
+    capCutExporting,
+    capCutExportProgress,
+    capCutStatus,
+    capCutReplaceableMode,
+    setCapCutReplaceableMode,
+    capCutMateStatus,
+    refreshCapCutMateStatus,
+    exportPrecheck,
+    exportBusy,
+    handleExport,
+    handleExportCapCut,
+    handleOpenCapCutDraft,
+    resetExportState,
+  } = useExportFlow({
+    projectId,
+    templateId,
+    slots,
+    assets,
+    templateProcessing,
+    matching,
+    subtitleRecognizing: recognizingAllSubtitles,
+    saveProject,
+    trackControls,
+    templateMusicEnabled,
+  });
+
+  const { uploadAssetFile, handleAssetUpload } = useAssetUpload({
+    setAssets,
+    setUploadingCount,
+  });
+
+  const {
+    handleTemplateUpload,
+    handleTemplateInstalled,
+    handleTemplateLibraryDelete,
+    handleTemplateLibraryLoad,
+  } = useTemplateFlow({
+    templateId,
+    projectId,
+    slots,
+    setTemplateId,
+    setTemplateName,
+    setTemplateVideoPath,
+    setTemplateAudioPath,
+    setTemplateProxyPaths,
+    setBeatMarkers,
+    setSfxMarkers,
+    setProjectId,
+    setSelectedSlotId,
+    replaceSlots,
+    resetHistory,
+    createProjectFromTemplate,
+    pauseAutosave,
+    resetExportState,
+    setUploadingCount,
+    setLoading,
+    lastTemplateSlotCountRef,
+  });
+
+  useEffect(() => {
+    if (!projectId || !templateId) return;
+    const running = templateProcessing.subtitleBatchRunning;
+    if (lastSubtitleBatchRunningRef.current && !running) {
+      void refreshProjectTimelineFromTemplate();
+    }
+    lastSubtitleBatchRunningRef.current = running;
+  }, [
+    projectId,
+    templateId,
+    templateProcessing.subtitleBatchRunning,
+    refreshProjectTimelineFromTemplate,
+  ]);
+
   const selectedSlot = useMemo(
-    () => slots.find((slot) => slot.id === selectedSlotId) ?? slots[0] ?? null,
+    () =>
+      selectedSlotId
+        ? slots.find((slot) => slot.id === selectedSlotId) ?? null
+        : null,
     [slots, selectedSlotId]
   );
 
@@ -419,42 +510,6 @@ export default function EditorPage() {
     }
     window.open(toMediaUrl(url), '_blank');
   };
-
-  const mapAssetFromApi = useCallback((asset: Record<string, unknown>): Asset => {
-    const filePath = (asset.file_path as string) || '';
-    const filename = String(asset.filename || '').trim();
-    const fallbackTitle =
-      filename || filePath.replace(/\\/g, '/').split('/').pop() || '未命名素材';
-    const segments = (asset.segments as VideoSegment[]) || [];
-    return {
-      id: asset.asset_id as string,
-      title: fallbackTitle,
-      filename: filename || fallbackTitle,
-      duration: formatDuration(Number(asset.duration || 0)),
-      durationSeconds: Number(asset.duration || 0),
-      tags: [],
-      filePath,
-      proxyPath: (asset.proxy_path as string) || undefined,
-      proxyPaths: (asset.proxy_paths as PreviewProxyPaths) || undefined,
-      thumbnail: asset.thumbnail as string | undefined,
-      segments,
-      segmentCount: Number(asset.segment_count ?? segments.length ?? 0),
-      processingStatus: (asset.processing_status as Asset['processingStatus']) || 'ready',
-      processingProgress: Number(asset.processing_progress ?? 100),
-    };
-  }, []);
-
-  const loadAssets = useCallback(async () => {
-    try {
-      const resp = await fetch(apiUrl('/api/assets/list'), { headers: apiHeaders() });
-      const data = await resp.json();
-      if (resp.ok) {
-        setAssets((data as Record<string, unknown>[]).map(mapAssetFromApi));
-      }
-    } catch (error) {
-      console.warn('加载素材列表失败', error);
-    }
-  }, [mapAssetFromApi]);
 
   const handleToggleTrackControl = useCallback((key: TrackKey, field: keyof TrackControls) => {
     setTrackControls((prev) => {
@@ -700,7 +755,7 @@ export default function EditorPage() {
     (asset: Asset, slotId: string, segmentId?: string): boolean => {
       if (isTrackLocked(trackControls, 'video')) {
         showTimelineHint('视频轨已锁定，请点击左侧轨道头解锁后再拖入素材');
-        return false;
+      return false;
       }
       const targetSlot = slots.find((slot) => slot.id === slotId);
       if (targetSlot?.locked) {
@@ -713,6 +768,7 @@ export default function EditorPage() {
           slot.id === slotId ? applyAssetToSlot(slot, binding) : slot
         )
       );
+      setIsPlaying(false);
       setSelectedSlotId(slotId);
       const slotIndex = slots.findIndex((slot) => slot.id === slotId);
       showTimelineHint(
@@ -720,7 +776,7 @@ export default function EditorPage() {
       );
       return true;
     },
-    [trackControls, slots, setSlots, resolveSegmentBinding, showTimelineHint]
+    [trackControls, slots, setSlots, setIsPlaying, resolveSegmentBinding, showTimelineHint]
   );
 
   const processingAssetIds = useMemo(
@@ -754,7 +810,7 @@ export default function EditorPage() {
             state.segmentCount ?? state.segments?.length ?? 0
           ),
           durationSeconds: durationSec > 0 ? durationSec : a.durationSeconds,
-          duration: durationSec > 0 ? formatDuration(durationSec) : a.duration,
+          duration: durationSec > 0 ? formatAssetDuration(durationSec) : a.duration,
           thumbnail: thumb || a.thumbnail,
           proxyPath: state.proxyPath || a.proxyPath,
           proxyPaths: state.proxyPaths || a.proxyPaths,
@@ -771,147 +827,6 @@ export default function EditorPage() {
     );
   });
 
-  const loadProject = useCallback(async (id: string) => {
-    skipAutosaveRef.current = true;
-    setLoadingProject(true);
-    try {
-      const resp = await fetch(apiUrl(`/api/projects/${id}`), { headers: apiHeaders() });
-      const data = await resp.json();
-      if (resp.ok) {
-        const project = data.project ?? data;
-        const timeline = (project.timeline || data.timeline || []) as Record<string, unknown>[];
-        setProjectId((project.project_id as string) ?? id);
-        setTemplateId((project.template_id as string) ?? null);
-        setTemplateName(
-          (data.name as string) ||
-            (project.name as string) ||
-            (data.template_name as string) ||
-            (data.template?.filename as string) ||
-            '已加载项目'
-        );
-        if (data.cover_thumbnail) setCoverThumbnail(data.cover_thumbnail as string);
-        else if (project.cover_thumbnail) setCoverThumbnail(project.cover_thumbnail as string);
-        if (data.template?.audio_path) setTemplateAudioPath(data.template.audio_path as string);
-        if (data.template?.file_path) setTemplateVideoPath(data.template.file_path as string);
-        if (data.template?.proxy_paths && typeof data.template.proxy_paths === 'object') {
-          setTemplateProxyPaths(data.template.proxy_paths as PreviewProxyPaths);
-        }
-        if (Array.isArray(data.template?.beat_markers)) {
-          setBeatMarkers(data.template.beat_markers as number[]);
-        }
-        if (Array.isArray(data.template?.sfx_markers)) {
-          setSfxMarkers(data.template.sfx_markers as SfxMarker[]);
-        }
-        if (data.match_strategy && typeof data.match_strategy === 'object') {
-          setMatchStrategy({ ...DEFAULT_MATCH_STRATEGY, ...(data.match_strategy as MatchStrategy) });
-        }
-        if (data.track_controls && typeof data.track_controls === 'object') {
-          setTrackControls(
-            mergeTrackControls(data.track_controls as Partial<Record<TrackKey, TrackControls>>)
-          );
-          setTrackHeights(extractTrackHeights(data.track_controls));
-        }
-        if (data.edl) {
-          setOverlayTracks(parseOverlayTracksFromEdl(data.edl as Record<string, unknown>));
-        }
-        const nextSlots = timelineToSlots(timeline);
-        replaceSlots(nextSlots);
-        resetHistory();
-        setSelectedSlotId(nextSlots[0]?.id ?? '');
-      } else {
-        alert(data.detail || '加载项目失败');
-      }
-    } catch (error) {
-      console.warn('加载项目失败', error);
-      alert('加载项目失败，请重试');
-    } finally {
-      setLoadingProject(false);
-      setTimeout(() => {
-        skipAutosaveRef.current = false;
-      }, 1500);
-    }
-  }, []);
-
-  useEffect(() => {
-    loadAssets();
-    const params = new URLSearchParams(window.location.search);
-    const id = params.get('project_id');
-    if (id) {
-      loadProject(id);
-    }
-  }, [loadAssets, loadProject]);
-
-  const saveProject = async (options?: { silent?: boolean }) => {
-    if (!projectId) {
-      if (!options?.silent) alert('请先创建项目');
-      return false;
-    }
-
-    const timelinePayload = slotsToTimeline(slots, assetMap);
-
-    if (!options?.silent) setSavingProject(true);
-    try {
-      const resp = await fetch(apiUrl(`/api/projects/${projectId}/timeline`), {
-        method: 'PUT',
-        headers: apiHeaders(),
-        body: JSON.stringify({
-          timeline: timelinePayload,
-          track_controls: embedTrackHeights(trackControls, trackHeights),
-          match_strategy: matchStrategy,
-          overlay_tracks: overlayTracksToPayload(overlayTracks),
-          cover_thumbnail: coverThumbnail || undefined,
-        }),
-      });
-      const data = await resp.json();
-      if (resp.ok && data.success) {
-        if (Array.isArray(data.timeline)) {
-          replaceSlots(timelineToSlots(data.timeline as Record<string, unknown>[]));
-        }
-        return true;
-      }
-      if (!options?.silent) alert(data.detail || '保存项目失败');
-      return false;
-    } catch (error) {
-      console.warn('保存项目失败', error);
-      if (!options?.silent) alert('保存项目失败，请重试');
-      return false;
-    } finally {
-      if (!options?.silent) setSavingProject(false);
-    }
-  };
-
-  saveProjectRef.current = () => saveProject({ silent: true });
-
-  useEffect(() => {
-    if (!projectId || skipAutosaveRef.current || loadingProject) return;
-
-    setAutosaveStatus('pending');
-    if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current);
-    autosaveTimerRef.current = setTimeout(async () => {
-      setAutosaveStatus('saving');
-      skipAutosaveRef.current = true;
-      const ok = await saveProjectRef.current();
-      setTimeout(() => {
-        skipAutosaveRef.current = false;
-      }, 500);
-      setAutosaveStatus(ok ? 'saved' : 'error');
-    }, 2000);
-
-    return () => {
-      if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current);
-    };
-  }, [
-    slots,
-    overlayTracks,
-    trackControls,
-    trackHeights,
-    matchStrategy,
-    matchWeights,
-    coverThumbnail,
-    projectId,
-    loadingProject,
-  ]);
-
   const handleSaveProject = async () => {
     if (await saveProject()) {
       setAutosaveStatus('saved');
@@ -919,175 +834,8 @@ export default function EditorPage() {
     }
   };
 
-  const runAutoMatch = async () => {
-    if (!projectId || !templateId) {
-      alert('请先上传模板并创建项目');
-      return;
-    }
-
-    if (!assets.length) {
-      alert('请先上传素材');
-      return;
-    }
-
-    setMatching(true);
-    setMatchError('');
-    setMatchMessage('');
-
-    try {
-      const saved = await saveProject();
-      if (!saved) {
-        throw new Error('保存当前项目失败');
-      }
-
-      const resp = await fetch(apiUrl('/api/match/run'), {
-        method: 'POST',
-        headers: apiHeaders(),
-        body: JSON.stringify({
-          project_id: projectId,
-          template_id: templateId,
-          asset_ids: assets.map((asset) => asset.id),
-          overwrite: true,
-          settings: strategyToSettings(matchStrategy),
-          strategy: matchStrategy,
-          weights: matchWeights,
-        }),
-      });
-      const data = await resp.json();
-      if (!resp.ok || !data.success) {
-        throw new Error(data.detail || data.error || 'AI 自动匹配失败');
-      }
-
-      if (Array.isArray(data.timeline)) {
-        setSlots(timelineToSlots(data.timeline as Record<string, unknown>[]));
-      }
-
-      setMatchMessage(`匹配完成：成功 ${data.matched_count || 0} 个，未匹配 ${data.unmatched_count || 0} 个`);
-    } catch (err: unknown) {
-      console.error(err);
-      setMatchError(err instanceof Error ? err.message : 'AI 自动匹配失败');
-    } finally {
-      setMatching(false);
-    }
-  };
-
   const handleLoadProjectClick = () => {
     setProjectListOpen(true);
-  };
-
-  const handleBatchRecognizeSubtitles = async () => {
-    if (!templateId || !slots.length) {
-      alert('请先上传模板');
-      return;
-    }
-    setRecognizingAllSubtitles(true);
-    try {
-      const payload = slots
-        .map((slot) => {
-          const range = getSlotSourceTimeRange(slot);
-          if (!range || range.end <= range.start) return null;
-          return {
-            slot_id: String(slot.originalSlotId ?? slot.id),
-            slot_start: range.start,
-            slot_end: range.end,
-          };
-        })
-        .filter(Boolean) as Array<{ slot_id: string; slot_start: number; slot_end: number }>;
-
-      if (!payload.length) {
-        alert('没有可识别的槽位');
-        return;
-      }
-
-      type BatchResult = {
-        slot_id?: string | number;
-        success?: boolean;
-        subtitle_text?: string;
-        subtitle_segments?: unknown[];
-        error?: string;
-        source?: string;
-      };
-
-      const applyBatchResults = (results: BatchResult[]) => {
-        const resultMap = new Map(results.map((r) => [String(r.slot_id ?? ''), r]));
-        setSlots((prev) =>
-          prev.map((slot) => {
-            const hit =
-              resultMap.get(String(slot.id)) ||
-              resultMap.get(String(slot.originalSlotId ?? ''));
-            if (!hit?.success) return slot;
-            return {
-              ...slot,
-              subtitleText: hit.subtitle_text || slot.subtitleText,
-              subtitle_segments: hit.subtitle_segments || slot.subtitle_segments,
-            };
-          })
-        );
-      };
-
-      const allResults: BatchResult[] = [];
-      for (let i = 0; i < payload.length; i += SUBTITLE_BATCH_CHUNK_SIZE) {
-        const chunk = payload.slice(i, i + SUBTITLE_BATCH_CHUNK_SIZE);
-        let chunkResults: BatchResult[] = [];
-        let lastError: Error | null = null;
-
-        for (let attempt = 0; attempt < 2; attempt += 1) {
-          try {
-            const resp = await fetch(longRunningApiUrl('/api/subtitle/recognize-slot-batch'), {
-              method: 'POST',
-              headers: apiHeaders(),
-              body: JSON.stringify({
-                template_id: templateId,
-                slots: chunk,
-                mode: 'auto',
-              }),
-            });
-            const data = await readApiJson(resp);
-            if (!resp.ok) {
-              throw new Error(formatApiDetail(data.detail, '批量识别失败'));
-            }
-            chunkResults = (data.results as BatchResult[] | undefined) || [];
-            lastError = null;
-            break;
-          } catch (err) {
-            lastError = err instanceof Error ? err : new Error('批量识别失败');
-            if (attempt === 0) {
-              await new Promise((resolve) => setTimeout(resolve, 800));
-            }
-          }
-        }
-
-        if (lastError) throw lastError;
-
-        allResults.push(...chunkResults);
-        applyBatchResults(chunkResults);
-      }
-
-      const withText = allResults.filter(
-        (r) => r.success && String(r.subtitle_text || '').trim()
-      ).length;
-      const whisperCount = allResults.filter((r) => r.success && (r as { source?: string }).source === 'whisper').length;
-      const ocrFallback = allResults.filter(
-        (r) => r.success && (r as { source?: string }).source === 'visual_fallback'
-      ).length;
-      const failed = allResults.filter((r) => r.success === false);
-
-      if (withText === 0) {
-        alert('识别完成，但未得到有效字幕。请确认模板含人声或画面烧录字幕。');
-      } else if (failed.length) {
-        alert(
-          `批量识别完成：${withText}/${payload.length} 个槽位有字幕（人声 ${whisperCount}，画面补识别 ${ocrFallback}，${failed.length} 个失败）`
-        );
-      } else {
-        alert(
-          `批量识别完成：${withText}/${payload.length} 个槽位有字幕（人声 ${whisperCount}，画面补识别 ${ocrFallback}）`
-        );
-      }
-    } catch (err) {
-      alert(err instanceof Error ? err.message : '批量识别失败');
-    } finally {
-      setRecognizingAllSubtitles(false);
-    }
   };
 
   const handleCoverUpload = async (file: File) => {
@@ -1111,127 +859,6 @@ export default function EditorPage() {
     };
     reader.readAsDataURL(file);
   };
-
-  const createProjectFromTemplate = async (templateIdValue: string) => {
-    const resp = await fetch(apiUrl('/api/projects/from-template'), {
-      method: 'POST',
-      headers: apiHeaders(),
-      body: JSON.stringify({ template_id: templateIdValue }),
-    });
-    const data = await resp.json();
-    if (!resp.ok || !data.success) {
-      throw new Error(data.detail || '创建项目失败');
-    }
-
-    setProjectId(data.project_id);
-    const nextSlots = timelineToSlots((data.timeline || []) as Record<string, unknown>[]);
-    replaceSlots(nextSlots);
-    resetHistory();
-    setSelectedSlotId(nextSlots[0]?.id ?? '');
-
-    return data;
-  };
-
-  const handleTemplateUpload = async (file: File) => {
-    const localPreview = URL.createObjectURL(file);
-    setTemplateVideoPath(localPreview);
-    skipAutosaveRef.current = true;
-    setUploadingCount((n) => n + 1);
-    try {
-      const data = await uploadTemplateWithProgress(file, () => undefined);
-      URL.revokeObjectURL(localPreview);
-      setTemplateId(data.template_id as string);
-      setTemplateName((data.filename as string) || '已上传模板');
-      if (data.file_path) setTemplateVideoPath(data.file_path as string);
-      await createProjectFromTemplate(data.template_id as string);
-      lastTemplateSlotCountRef.current = Number(data.slot_count ?? 1);
-    } catch (error) {
-      URL.revokeObjectURL(localPreview);
-      console.warn('模板上传失败', error);
-      alert(error instanceof Error ? error.message : '模板上传失败，请重试');
-    } finally {
-      setUploadingCount((n) => Math.max(0, n - 1));
-      setTimeout(() => {
-        skipAutosaveRef.current = false;
-      }, 1500);
-    }
-  };
-
-  const uploadAssetFile = useCallback(async (file: File): Promise<Asset | null> => {
-    const tempId = `uploading-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const localPreview = URL.createObjectURL(file);
-    const optimistic: Asset = {
-      id: tempId,
-      title: file.name,
-      duration: '--:--',
-      durationSeconds: 0,
-      tags: [],
-      filePath: localPreview,
-      thumbnail: localPreview,
-      processingStatus: 'processing',
-      processingProgress: 0,
-    };
-
-    setUploadingCount((n) => n + 1);
-    setAssets((current) => [...current, optimistic]);
-
-    try {
-      const data = await uploadAssetWithProgress(file, ({ percent }) => {
-        setAssets((current) =>
-          current.map((a) =>
-            a.id === tempId ? { ...a, processingProgress: Math.max(1, percent) } : a
-          )
-        );
-      });
-
-      const asset: Asset = {
-        id: data.asset_id as string,
-        title: (data.filename as string) || file.name,
-        filename: (data.filename as string) || file.name,
-        duration: formatDuration(Number(data.duration || 0)),
-        durationSeconds: Number(data.duration || 0),
-            tags: [],
-        filePath: (data.file_path as string) || '',
-        segments: (data.segments as VideoSegment[]) || [],
-        proxyPath: (data.proxy_path as string) || undefined,
-        proxyPaths: (data.proxy_paths as PreviewProxyPaths) || undefined,
-        thumbnail: (data.thumbnail as string) || localPreview,
-        processingStatus: data.processing ? 'processing' : 'ready',
-        processingProgress: Number(data.processing_progress ?? 12),
-      };
-
-      setAssets((current) => current.map((a) => (a.id === tempId ? asset : a)));
-      if (data.thumbnail) {
-        URL.revokeObjectURL(localPreview);
-      }
-      return asset;
-    } catch (error) {
-      console.warn('素材上传失败', error);
-      setAssets((current) => current.filter((a) => a.id !== tempId));
-      URL.revokeObjectURL(localPreview);
-      alert(error instanceof Error ? error.message : '素材上传失败，请重试');
-      return null;
-    } finally {
-      setUploadingCount((n) => Math.max(0, n - 1));
-    }
-  }, []);
-
-  const handleAssetUpload = useCallback(
-    (fileOrFiles: File | File[]) => {
-      const files = Array.isArray(fileOrFiles) ? fileOrFiles : [fileOrFiles];
-      const concurrency = 3;
-      let index = 0;
-      const workers = Array.from({ length: Math.min(concurrency, files.length) }, async () => {
-        while (index < files.length) {
-          const current = files[index];
-          index += 1;
-          await uploadAssetFile(current);
-        }
-      });
-      void Promise.all(workers);
-    },
-    [uploadAssetFile]
-  );
 
   const resolveDropSlotId = useCallback(
     (time: number, preferredSlotId?: string | null) => {
@@ -1341,8 +968,12 @@ export default function EditorPage() {
       return;
     }
     if (updates.useOriginalAudio !== undefined && isTrackLocked(trackControls, 'audioVoice')) return;
+    const mergedUpdates =
+      updates.subtitleText !== undefined && updates.subtitle_segments === undefined
+        ? { ...updates, ...syncSubtitleTextUpdate(selectedSlot, updates.subtitleText) }
+        : updates;
     setSlots((current) =>
-      current.map((slot) => (slot.id === selectedSlot.id ? { ...slot, ...updates } : slot))
+      current.map((slot) => (slot.id === selectedSlot.id ? { ...slot, ...mergedUpdates } : slot))
     );
   };
 
@@ -1361,7 +992,9 @@ export default function EditorPage() {
     (slotId: string, text: string) => {
       if (isTrackLocked(trackControls, 'subtitle')) return;
       setSlots((prev) =>
-        prev.map((slot) => (slot.id === slotId ? { ...slot, subtitleText: text } : slot))
+        prev.map((slot) =>
+          slot.id === slotId ? { ...slot, ...syncSubtitleTextUpdate(slot, text) } : slot
+        )
       );
     },
     [trackControls, setSlots]
@@ -1379,25 +1012,69 @@ export default function EditorPage() {
     [trackControls, setSlots]
   );
 
-  const handleTemplateInstalled = async (tid: string) => {
-    setLoading(true);
+  const handleApplyEffectPresets = useCallback(
+    (updated: TemplateSlot[]) => {
+      if (isTrackLocked(trackControls, 'video')) return;
+      setSlots(updated);
+    },
+    [trackControls, setSlots]
+  );
+
+  const handleAnalyzeTemplateEffects = useCallback(async () => {
+    if (!templateId) return;
+    setAnalyzingTemplateEffects(true);
     try {
-      setTemplateId(tid);
-      const tplResp = await fetch(apiUrl(`/api/template/${tid}`), { headers: apiHeaders() });
-      const tplData = await tplResp.json();
-      if (tplResp.ok) {
-        setTemplateName((tplData.filename as string) || '市场模板');
-        if (tplData.audio_path) setTemplateAudioPath(tplData.audio_path as string);
-        if (tplData.file_path) setTemplateVideoPath(tplData.file_path as string);
+      const resp = await fetch(apiUrl(`/api/template/${templateId}/analyze-effects`), {
+        method: 'POST',
+        headers: apiHeaders(),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        throw new Error(typeof data.detail === 'string' ? data.detail : '模板特效分析失败');
       }
-      await createProjectFromTemplate(tid);
-      setExportStatus('');
+      const tplSlots = (data.slots || []) as Record<string, unknown>[];
+      setSlots((prev) =>
+        prev.map((slot, index) => {
+          const tpl =
+            tplSlots.find((t) => String(t.slot_id) === String(slot.originalSlotId ?? index + 1)) ||
+            tplSlots[index];
+          if (!tpl || typeof tpl !== 'object') return slot;
+          const auto = tpl.auto_effects as Record<string, unknown> | undefined;
+          const subStyle = auto?.subtitle_style as Record<string, unknown> | undefined;
+          let subtitle_segments = slot.subtitle_segments;
+          if (Array.isArray(tpl.subtitle_segments) && tpl.subtitle_segments.length) {
+            subtitle_segments = tpl.subtitle_segments as unknown[];
+          }
+          return {
+            ...slot,
+            auto_effects: auto,
+            template_effect_label: tpl.template_effect_label as string | undefined,
+            subtitle_segments,
+            colorGrade:
+              slot.colorGrade ||
+              (auto?.color_grade as TemplateSlot['colorGrade']) ||
+              (tpl.color_grade as TemplateSlot['colorGrade']),
+            keyframes:
+              slot.keyframes && slot.keyframes.length > 0
+                ? slot.keyframes
+                : ((auto?.keyframes as TemplateSlot['keyframes']) ||
+                    (tpl.keyframes as TemplateSlot['keyframes']) ||
+                    []),
+            transitionOut:
+              slot.transitionOut ||
+              (auto?.transition_out as TemplateSlot['transitionOut']) ||
+              (tpl.transition_out as TemplateSlot['transitionOut']),
+            subtitle_style: subStyle as TemplateSlot['subtitle_style'],
+          };
+        })
+      );
+      showTimelineHint('模板特效 AI 分析完成，导出剪映草稿时将烧录进画面');
     } catch (err) {
-      alert(err instanceof Error ? err.message : '安装模板失败');
+      showTimelineHint(err instanceof Error ? err.message : '模板特效分析失败');
     } finally {
-      setLoading(false);
+      setAnalyzingTemplateEffects(false);
     }
-  };
+  }, [templateId, setSlots, showTimelineHint]);
 
   const handleRenameProject = async () => {
     if (!projectId) return;
@@ -1424,94 +1101,99 @@ export default function EditorPage() {
     templateFileInputRef.current?.click();
   }, []);
 
-  const handleRecognizeSlotSubtitle = async () => {
-    if (!selectedSlot || !templateId) {
-      alert('请先导入模板并选择槽位');
-      return;
-    }
-    if (isTrackLocked(trackControls, 'subtitle')) {
-      alert('字幕轨已锁定，请先解锁后再识别');
-      return;
-    }
+  const handleRecognizeSlotSubtitle = useCallback(
+    async () => {
+      if (!selectedSlot || !templateId) {
+        alert('请先导入模板并选择槽位');
+        return;
+      }
+      if (isTrackLocked(trackControls, 'subtitle')) {
+        alert('字幕轨已锁定，请先解锁后再识别');
+        return;
+      }
 
-    const range = getSlotSourceTimeRangeById(slots, selectedSlot.id);
-    if (!range || range.end <= range.start) {
-      alert('无法确定当前槽位的时间范围');
-      return;
-    }
+      const range = getSlotSourceTimeRangeById(slots, selectedSlot.id);
+      if (!range || range.end <= range.start) {
+        alert('无法确定当前槽位的时间范围');
+        return;
+      }
 
-    setRecognizingSubtitle(true);
-    try {
-      const resp = await fetch(longRunningApiUrl('/api/subtitle/recognize-slot'), {
+      setRecognizingSubtitle(true);
+      try {
+        const resp = await fetch(longRunningApiUrl('/api/subtitle/recognize-slot'), {
         method: 'POST',
-        headers: apiHeaders(),
-        body: JSON.stringify({
-          template_id: templateId,
-          slot_start: range.start,
-          slot_end: range.end,
-          slot_id: String(selectedSlot.originalSlotId ?? selectedSlot.id),
-          force: true,
-          mode: 'auto',
-        }),
-      });
-      const data = await readApiJson(resp);
-      if (!resp.ok || !data.success) {
-        throw new Error(formatApiDetail(data.detail, '字幕识别失败'));
-      }
+          headers: apiHeaders(),
+          body: JSON.stringify({
+            template_id: templateId,
+            slot_start: range.start,
+            slot_end: range.end,
+            slot_id: String(selectedSlot.originalSlotId ?? selectedSlot.id),
+            force: true,
+            quality: false,
+            mode: subtitleMode,
+          }),
+        });
+        const data = await readApiJson(resp);
+        if (!resp.ok) {
+          throw new Error(formatApiDetail(data.detail, '字幕识别失败'));
+        }
+        if (data.status === 'error' || (data.success === false && !data.status)) {
+          const reason = String(
+            data.error || data.reason || data.subtitle_status_reason || '识别异常，请重试或手填'
+          );
+          handleUpdateSlot({
+            subtitleText: String(data.subtitle_text || ''),
+            subtitle_segments: (data.subtitle_segments as unknown[]) || [],
+            subtitle_source: data.source as string | undefined,
+            subtitle_quality: data.subtitle_quality as import('@/lib/timeline').TemplateSlot['subtitle_quality'],
+            subtitle_status_reason: data.subtitle_status_reason as string | undefined,
+          });
+          alert(reason);
+          return;
+        }
 
-      handleUpdateSlot({
-        subtitleText: String(data.subtitle_text || ''),
-        subtitle_segments: (data.subtitle_segments as unknown[]) || [],
-      });
-      if (!String(data.subtitle_text || '').trim()) {
-        alert('未得到有效字幕，请确认该槽位含人声或画面烧录字幕');
-      }
-    } catch (err) {
-      console.error(err);
-      alert(err instanceof Error ? err.message : '字幕识别失败');
+        handleUpdateSlot({
+          subtitleText: String(data.subtitle_text || ''),
+          subtitle_segments: (data.subtitle_segments as unknown[]) || [],
+          subtitle_visual_context: data.subtitle_visual_context as string | undefined,
+          subtitle_scene_match:
+            data.subtitle_scene_match != null ? Number(data.subtitle_scene_match) : undefined,
+          subtitle_scene_match_reason: data.subtitle_scene_match_reason as string | undefined,
+          subtitle_effect_label: data.subtitle_effect_label as string | undefined,
+          subtitle_style: data.subtitle_style as import('@/lib/slotEdit').SubtitleStyle | undefined,
+          ai_effect_understanding: data.ai_effect_understanding as import('@/lib/timeline').AiEffectUnderstanding | undefined,
+          applied_effect_presets: (data.applied_effect_presets as string[]) || undefined,
+          ai_description: data.ai_description as string | undefined,
+          ai_subject: data.ai_subject as string | undefined,
+          scene_tags: (data.scene_tags as string[]) || undefined,
+          subtitle_source: data.source as string | undefined,
+          subtitle_quality: data.subtitle_quality as import('@/lib/timeline').TemplateSlot['subtitle_quality'],
+          subtitle_status_reason: (data.reason as string | undefined) ?? data.subtitle_status_reason as string | undefined,
+          subtitle_duplicate: Boolean(data.subtitle_duplicate ?? false),
+        });
+        const slotStatus = String(data.status || '');
+        if (slotStatus === 'no_speech' || slotStatus === 'no_overlap') {
+          alert('该槽位时间段未检测到人声字幕。');
+        } else if (slotStatus === 'filtered') {
+          alert('该槽位检测到疑似幻听/低置信度片段，已过滤。');
+        } else if (!String(data.subtitle_text || '').trim()) {
+          alert(
+            String(
+              data.reason ||
+                data.subtitle_status_reason ||
+                '未得到有效字幕，请确认该槽位含人声'
+            )
+          );
+        }
+      } catch (err) {
+        console.error(err);
+        alert(err instanceof Error ? err.message : '字幕识别失败');
     } finally {
-      setRecognizingSubtitle(false);
-    }
-  };
-
-  const totalDuration = useMemo(() => getTotalDuration(slots), [slots]);
-
-  const handlePlayheadStep = useCallback(
-    (deltaSec: number) => {
-      setIsPlaying(false);
-      setPlayheadTime((t) => snapToFrame(Math.max(0, Math.min(totalDuration, t + deltaSec))));
-    },
-    [totalDuration]
-  );
-
-  useEffect(() => {
-    playheadRef.current = playheadTime;
-  }, [playheadTime]);
-
-  const handleTogglePlay = useCallback(() => {
-    setIsPlaying((playing) => {
-      if (!playing) {
-        playStartRef.current = { wall: performance.now(), time: playheadRef.current };
-      }
-      return !playing;
-    });
-  }, []);
-
-  const handlePlayheadChange = useCallback(
-    (time: number) => {
-      const snapped = snapToFrame(time);
-      setPlayheadTime(snapped);
-      playheadRef.current = snapped;
-      if (snapped >= totalDuration - 1 / 30) {
-        setIsPlaying(false);
+        setRecognizingSubtitle(false);
       }
     },
-    [totalDuration]
+    [selectedSlot, templateId, trackControls, slots, handleUpdateSlot, subtitleMode]
   );
-
-  const handleScrubStart = useCallback(() => {
-    setIsPlaying(false);
-  }, []);
 
   const handleTrimSlot = useCallback(
     (slotId: string, mode: 'start' | 'end', deltaSec: number) => {
@@ -1562,53 +1244,6 @@ export default function EditorPage() {
     [trackControls, setSlots]
   );
 
-  const handleTemplateLibraryDelete = useCallback(
-    (tid: string) => {
-      if (templateId !== tid) return;
-      setTemplateId(null);
-      setTemplateName('未选择模板');
-      setTemplateVideoPath('');
-      setTemplateAudioPath('');
-      setTemplateProxyPaths({});
-      setBeatMarkers([]);
-      setSfxMarkers([]);
-      replaceSlots([]);
-      resetHistory();
-      setSelectedSlotId('');
-      setProjectId(null);
-      setExportUrl(null);
-      setExportStatus('');
-      setExportError('');
-    },
-    [templateId, replaceSlots, resetHistory]
-  );
-
-  const handleTemplateLibraryLoad = useCallback(
-    async (tid: string) => {
-      if (
-        projectId &&
-        slots.some((s) => s.matchedAssetId || s.asset_file_path) &&
-        !window.confirm('切换模板将重建时间线，已匹配素材会丢失，是否继续？')
-      ) {
-        return;
-      }
-      try {
-        const tplResp = await fetch(apiUrl(`/api/template/${tid}`), { headers: apiHeaders() });
-        const tpl = await tplResp.json();
-        if (!tplResp.ok) throw new Error(tpl.detail || '模板加载失败');
-        setTemplateId(tid);
-        setTemplateName((tpl.filename as string) || '模板');
-        if (tpl.file_path) setTemplateVideoPath(tpl.file_path as string);
-        if (tpl.audio_path) setTemplateAudioPath(tpl.audio_path as string);
-        await createProjectFromTemplate(tid);
-        setExportStatus('');
-      } catch (err) {
-        alert(err instanceof Error ? err.message : '载入模板失败');
-      }
-    },
-    [projectId, slots, createProjectFromTemplate]
-  );
-
   const handleRippleClearRight = useCallback(() => {
     if (!selectedSlotId || isTrackLocked(trackControls, 'video')) return;
     setSlots((prev) => rippleClearRight(prev, selectedSlotId));
@@ -1622,26 +1257,10 @@ export default function EditorPage() {
     const next = splitSlotAtTime(slots, playheadTime);
     if (!next) {
       alert('请在槽位中间位置分割（槽位未锁定）');
-      return;
-    }
+        return;
+      }
     setSlots(next);
   }, [slots, playheadTime, setSlots, trackControls]);
-
-  useEffect(() => {
-    // 播放时由 PreviewPanel 视频时钟驱动播放头，避免双时钟打架导致切镜卡顿
-    if (isPlaying) {
-      if (playRafRef.current != null) {
-        cancelAnimationFrame(playRafRef.current);
-        playRafRef.current = null;
-      }
-      return;
-    }
-
-    if (playRafRef.current != null) {
-      cancelAnimationFrame(playRafRef.current);
-      playRafRef.current = null;
-    }
-  }, [isPlaying]);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -1668,239 +1287,12 @@ export default function EditorPage() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [handleTogglePlay, handleSplitAtPlayhead, handleRippleClearRight, handleDeleteSlot, selectedSlotId, undo, redo]);
 
-  const pollExportTask = async (taskId: string) => {
-    for (let i = 0; i < 120; i++) {
-      await new Promise((r) => setTimeout(r, 1500));
-      const resp = await fetch(apiUrl(`/api/export/tasks/${taskId}`), { headers: apiHeaders() });
-      const data = await resp.json();
-      if (data.status === 'completed' && data.result?.output_url) {
-        setExportProgress(100);
-        return data.result.output_url as string;
-      }
-      if (data.status === 'failed') {
-        throw new Error(formatExportError(data.error || '导出失败'));
-      }
-      const progress = data.progress ?? Math.min(95, Math.round(((i + 1) / 120) * 100));
-      setExportProgress(progress);
-      setExportStatus(`云渲染中… ${progress}%`);
-    }
-    throw new Error('导出超时');
-  };
-
   const handleOverlayDelete = useCallback((track: 'v2' | 'v3', clipId: string) => {
     setOverlayTracks((prev) => ({
       ...prev,
       [track]: prev[track].filter((clip) => clip.id !== clipId),
     }));
   }, []);
-
-  const handleExportCapCut = async () => {
-    if (!projectId || !templateId || !slots.length) {
-      alert('请先导入模板并完成时间线后再导出');
-      return;
-    }
-
-    const precheck = buildExportPrecheck(slots, assets, templateProcessing, {
-      matching,
-      exporting: exporting || capCutExporting,
-      capcutReplaceable: capCutReplaceableMode,
-    });
-    if (!precheck.canProceed) {
-      alert(formatExportPrecheckDialog(precheck));
-      return;
-    }
-    const confirmLabel = capCutReplaceableMode ? '是否继续导出可替换模板草稿？' : '是否继续导出剪映草稿？';
-    if (precheck.warnings.length && !window.confirm(`${formatExportPrecheckDialog(precheck)}\n\n${confirmLabel}`)) {
-      return;
-    }
-
-    const status = await fetchCapCutStatusWithRetry(3, 500);
-    setCapCutMateStatus(status);
-    if (!status?.ready) {
-      setCapCutStatus(
-        '剪映小助手未连接。请先运行 scripts/start-capcut-mate.ps1 启动服务（默认 http://127.0.0.1:30000），然后点「重新检测」'
-      );
-      return;
-    }
-
-    setCapCutExporting(true);
-    setCapCutExportProgress(5);
-    setCapCutDraftUrl(null);
-    setCapCutStatus(
-      capCutReplaceableMode ? '正在生成可替换模板草稿…' : '正在保存并生成剪映草稿…'
-    );
-
-    let exportSucceeded = false;
-
-    try {
-      const saved = await saveProject();
-      if (!saved) {
-        alert('保存项目失败，无法导出剪映草稿');
-        return;
-      }
-
-      const exportPayload = buildExportPayload({
-        trackControls,
-        templateMusicEnabled,
-        useAssetAudio: slots.some((slot) => slot.useOriginalAudio),
-        addSubtitles,
-      });
-
-      const capCutRequestBody = {
-        project_id: projectId,
-        ...exportPayload,
-        template_music_enabled: templateMusicEnabled,
-        resolution: exportResolution,
-        include_template_slots: true,
-        capcut_export_mode: capCutReplaceableMode ? 'replaceable_template' : 'filled',
-        media_base_url: guessMediaBaseUrl(),
-      };
-
-      const capCutCallbacks = {
-        onProgress: setCapCutExportProgress,
-        onStatus: setCapCutStatus,
-      };
-
-      const runSyncExport = () => exportCapCutDraftSync(capCutRequestBody, capCutCallbacks);
-
-      let result: CapCutExportResult;
-
-      const asyncResp = await fetch(apiUrl('/api/export/capcut-draft-async'), {
-        method: 'POST',
-        headers: apiHeaders(),
-        body: JSON.stringify(capCutRequestBody),
-      });
-      const asyncData = (await asyncResp.json()) as CapCutExportResult & { task_id?: string };
-      const asyncUnavailable =
-        asyncResp.status === 404 ||
-        String(asyncData.detail || '').toLowerCase().includes('not found');
-
-      if (asyncUnavailable || !asyncResp.ok || !asyncData.task_id) {
-        result = await runSyncExport();
-      } else {
-        setCapCutStatus('导出任务已提交，正在裁剪并写入剪映草稿…');
-        result = await pollCapCutExportTask(asyncData.task_id, runSyncExport, capCutCallbacks);
-      }
-
-      const draftUrl = (result.draft_url as string) || null;
-      setCapCutDraftUrl(draftUrl);
-      const skipped = (result.skipped_slots as string[] | undefined) || [];
-      const warnings = (result.warnings as string[] | undefined) || [];
-      const skipHint = skipped.length ? `（跳过 ${skipped.length} 个槽位）` : '';
-      const warnHint = warnings.length ? `；${warnings[0]}` : '';
-      const modeHint = capCutReplaceableMode
-        ? '。打开后在剪映中选中片段 → 替换素材'
-        : '。正在安装到剪映…';
-      setCapCutExportProgress(100);
-      const captionHint =
-        capCutReplaceableMode && (result.captions_count ?? 0) > 0
-          ? `、${result.captions_count} 条字幕`
-          : !capCutReplaceableMode && (result.captions_count ?? 0) > 0
-            ? `、${result.captions_count} 条字幕`
-            : '';
-      setCapCutStatus(
-        `已生成 ${result.clips_count ?? 0} 个片段${captionHint}${skipHint}${warnHint}${modeHint}`
-      );
-      exportSucceeded = true;
-
-      if (draftUrl) {
-        void installAndOpenCapCutDraft(draftUrl, setCapCutStatus).catch((err) => {
-          const msg = err instanceof Error ? err.message : '安装剪映草稿失败';
-          setCapCutStatus(msg);
-          alert(msg);
-        });
-      }
-    } catch (error) {
-      const message = formatExportError(error);
-      setCapCutStatus(message);
-      setCapCutDraftUrl(null);
-      alert(`剪映草稿导出失败\n\n${message}`);
-    } finally {
-      setCapCutExporting(false);
-      if (!exportSucceeded) {
-        setCapCutExportProgress(0);
-      }
-    }
-  };
-
-  const handleOpenCapCutDraft = useCallback(() => {
-    if (!capCutDraftUrl) return;
-    void installAndOpenCapCutDraft(capCutDraftUrl, setCapCutStatus).catch((err) => {
-      const msg = err instanceof Error ? err.message : '打开剪映草稿失败';
-      setCapCutStatus(msg);
-      alert(msg);
-    });
-  }, [capCutDraftUrl]);
-
-  const handleExport = async () => {
-    if (!projectId || !templateId || !slots.length) {
-      alert('请先导入模板并完成时间线后再导出');
-      return;
-    }
-
-    const precheck = buildExportPrecheck(slots, assets, templateProcessing, {
-      matching,
-      exporting: exporting || capCutExporting,
-    });
-    if (!precheck.canProceed) {
-      alert(formatExportPrecheckDialog(precheck));
-      return;
-    }
-    if (precheck.warnings.length && !window.confirm(`${formatExportPrecheckDialog(precheck)}\n\n是否继续导出？`)) {
-      return;
-    }
-
-    setExporting(true);
-    setExportError('');
-    setExportUrl(null);
-    setExportProgress(0);
-    setExportStatus('正在保存并导出...');
-
-    try {
-      const saved = await saveProject();
-      if (!saved) {
-        setExportError('保存项目失败');
-        setExportStatus('保存项目失败');
-        return;
-      }
-
-      const exportPayload = buildExportPayload({
-        trackControls,
-        templateMusicEnabled,
-        useAssetAudio: slots.some((slot) => slot.useOriginalAudio),
-        addSubtitles,
-      });
-
-      const resp = await fetch(apiUrl('/api/export/render-async'), {
-        method: 'POST',
-        headers: apiHeaders(),
-        body: JSON.stringify({
-          project_id: projectId,
-          ...exportPayload,
-          template_music_enabled: templateMusicEnabled,
-          resolution: exportResolution,
-          use_edl: true,
-          use_nvenc: true,
-        }),
-      });
-      const data = await resp.json();
-      if (!resp.ok || !data.task_id) {
-        throw new Error(formatExportError(data.detail || '导出任务创建失败'));
-      }
-      setExportStatus('导出任务已提交…');
-      const outputUrl = await pollExportTask(data.task_id);
-      setExportUrl(outputUrl);
-      setExportStatus('导出完成，点击下载查看成片。');
-    } catch (error) {
-      console.warn('导出失败', error);
-      setExportUrl(null);
-      const message = formatExportError(error);
-      setExportError(message);
-      setExportStatus(message);
-    } finally {
-      setExporting(false);
-    }
-  };
 
   const matchedSlotCount = useMemo(
     () => slots.filter((slot) => slot.matchedAssetId || slot.asset_file_path).length,
@@ -1925,15 +1317,6 @@ export default function EditorPage() {
     [templateId, templateReady, assets.length, slots, matchedSlotCount]
   );
 
-  const exportPrecheck = useMemo(
-    () =>
-      buildExportPrecheck(slots, assets, templateProcessing, {
-        matching,
-        exporting: exporting || capCutExporting,
-      }),
-    [slots, assets, templateProcessing, matching, exporting, capCutExporting]
-  );
-
   const globalStatusItems = useMemo((): GlobalStatusItem[] => {
     const items: GlobalStatusItem[] = [];
 
@@ -1952,7 +1335,7 @@ export default function EditorPage() {
         p < 40
           ? '读取视频信息'
           : p < 90
-            ? '按画面切分槽位（约 10 秒内可编辑）'
+            ? 'AI 分析模板：切分画面 + 识别字幕 + 花字特效（约 30 秒）'
             : '即将完成';
       items.push({
         id: 'template',
@@ -2015,6 +1398,81 @@ export default function EditorPage() {
       items.push({ id: 'match', label: 'AI 匹配中', progress: 0, status: 'processing' });
     }
 
+    if (recognizingAllSubtitles || templateProcessing.subtitleBatchRunning) {
+      items.push({
+        id: 'subtitle-batch',
+        label: '字幕识别中',
+        detail: templateProcessing.subtitleBatchRunning
+          ? templateProcessing.subtitleProgressLabel ||
+            `后台识别 ${templateProcessing.slotsSubtitleReadyCount}/${templateProcessing.slotCount || '?'}`
+          : '识别全部槽位字幕',
+        progress: templateProcessing.subtitleBatchRunning
+          ? Math.round(
+              ((templateProcessing.slotCount -
+                templateProcessing.subtitleEmptyCount -
+                templateProcessing.subtitleLowCount) /
+                Math.max(1, templateProcessing.slotCount)) *
+                100
+            )
+          : 0,
+        indeterminate: !templateProcessing.subtitleBatchRunning,
+        status: 'processing',
+      });
+    }
+
+    if (
+      templateId &&
+      templateProcessing.status === 'ready' &&
+      !recognizingAllSubtitles &&
+      !templateProcessing.subtitleBatchRunning &&
+      (templateProcessing.subtitleEmptyCount > 0 ||
+        templateProcessing.subtitleLowCount > 0 ||
+        templateProcessing.subtitleDuplicateCount > 0)
+    ) {
+      const parts: string[] = [];
+      if (templateProcessing.subtitleEmptyCount > 0) {
+        parts.push(`${templateProcessing.subtitleEmptyCount} 个空槽位`);
+      }
+      if (templateProcessing.subtitleLowCount > 0) {
+        parts.push(`${templateProcessing.subtitleLowCount} 个质量偏低`);
+      }
+      if (templateProcessing.subtitleDuplicateCount > 0) {
+        parts.push(`${templateProcessing.subtitleDuplicateCount} 个疑似重复`);
+      }
+      items.push({
+        id: 'subtitle-quality',
+        label: '字幕需关注',
+        detail:
+          templateProcessing.subtitleProgressLabel ||
+          `${parts.join('，')} — 可在「字幕」页重识别或手改`,
+        progress: Math.round(
+          ((templateProcessing.slotCount -
+            templateProcessing.subtitleEmptyCount -
+            templateProcessing.subtitleLowCount) /
+            Math.max(1, templateProcessing.slotCount)) *
+            100
+        ),
+        status: 'warning',
+      });
+    }
+
+    if (
+      templateId &&
+      templateProcessing.status === 'ready' &&
+      !templateProcessing.aiUnderstandingReady &&
+      templateProcessing.slotCount > 0
+    ) {
+      items.push({
+        id: 'ai-understanding',
+        label: '模板 AI 理解未完成',
+        detail: `已理解 ${templateProcessing.slotsAiReadyCount}/${templateProcessing.slotCount} 镜，匹配准确度可能下降`,
+        progress: Math.round(
+          (templateProcessing.slotsAiReadyCount / Math.max(1, templateProcessing.slotCount)) * 100
+        ),
+        status: 'warning',
+      });
+    }
+
     if (exporting) {
       items.push({
         id: 'export',
@@ -2042,6 +1500,7 @@ export default function EditorPage() {
     templateProcessing,
     assets,
     matching,
+    recognizingAllSubtitles,
     exporting,
     exportProgress,
     capCutExporting,
@@ -2063,11 +1522,20 @@ export default function EditorPage() {
         case 'template':
           triggerTemplateImport();
           break;
-        case 'assets':
-          alert('请在左侧「素材库」标签页上传你的旅行视频，等待分析完成');
+        case 'subtitle':
+          void handleRecognizeAllSubtitles();
           break;
         case 'match':
+          if (!assets.length) {
+            alert('请先在左侧「素材库」上传旅行视频，等待分析完成后再智能匹配');
+            break;
+          }
           void runAutoMatch();
+          break;
+        case 'polish':
+          alert(
+            '第 4 步：在右侧修改字幕文案；左侧「特效库」为槽位应用花字/动效（AI 仅推荐，需您手动点「应用」）。'
+          );
           break;
         case 'export':
           void handleExport();
@@ -2076,7 +1544,7 @@ export default function EditorPage() {
           break;
       }
     },
-    [triggerTemplateImport, runAutoMatch, handleExport]
+    [triggerTemplateImport, handleRecognizeAllSubtitles, runAutoMatch, handleExport, assets.length]
   );
 
   const projectTitle = templateName !== '未选择模板' ? templateName : '未命名草稿';
@@ -2154,6 +1622,7 @@ export default function EditorPage() {
         >
           <PreviewPanel
             slots={slots}
+            subtitleClips={subtitleClips}
             selectedSlot={selectedSlot}
             playheadTime={playheadTime}
             isPlaying={isPlaying}
@@ -2237,10 +1706,31 @@ export default function EditorPage() {
                 templateAudioUrl={templateAudioPath}
                 onToggleTemplateMusic={handleToggleTemplateMusic}
                 onToggleSlotOriginalAudio={handleToggleSlotOriginalAudio}
-                onBatchRecognizeSubtitles={() => void handleBatchRecognizeSubtitles()}
+                onRecognizeAllSubtitles={() => void handleRecognizeAllSubtitles()}
+                onApplyCaptionSlots={() => void applyCaptionSlots()}
+                onApplyVisualSceneSlots={() => void applyVisualSceneSlots()}
+                applyingCaptionSlots={applyingCaptionSlots}
+                onGenerateTts={() => void generateTts()}
+                onAlignTimelineToTts={() => void alignTimelineToTts()}
+                generatingTts={generatingTts}
+                aligningTimeline={aligningTimeline}
+                voiceProfiles={voiceProfiles}
+                selectedVoiceId={selectedVoiceId}
+                onVoiceChange={setSelectedVoiceId}
+                ttsSegments={ttsSegments}
+                onUpdateSubtitleClip={updateSubtitleClipAt}
                 recognizingAllSubtitles={recognizingAllSubtitles}
+                recognizeProgress={recognizeProgress}
+                subtitleMode={subtitleMode}
+                onSubtitleModeChange={setSubtitleMode}
+                spokenCaptions={spokenCaptions}
+                subtitleClips={subtitleClips}
+                recognitionDebug={recognitionDebug}
                 onRecognizeSlotSubtitle={() => void handleRecognizeSlotSubtitle()}
                 recognizingSlotSubtitle={recognizingSubtitle}
+                onApplyEffectPresets={handleApplyEffectPresets}
+                onAnalyzeTemplateEffects={() => void handleAnalyzeTemplateEffects()}
+                analyzingTemplateEffects={analyzingTemplateEffects}
                 onTemplateLibrarySelect={(tid) => void handleTemplateLibraryLoad(tid)}
                 onTemplateLibraryImported={(tid) => void handleTemplateLibraryLoad(tid)}
                 onTemplateLibraryDeleted={handleTemplateLibraryDelete}
@@ -2288,9 +1778,7 @@ export default function EditorPage() {
                 onToggleTemplateMusic={handleToggleTemplateMusic}
                 templateId={templateId}
                 recognizingSubtitle={recognizingSubtitle}
-                onRecognizeSlotSubtitle={handleRecognizeSlotSubtitle}
-                onRecognizeAllSubtitles={handleBatchRecognizeSubtitles}
-                recognizingAllSubtitles={recognizingAllSubtitles}
+                onRecognizeSlotSubtitle={() => void handleRecognizeSlotSubtitle()}
                 onImportTemplate={triggerTemplateImport}
                 onMoveSlot={handleMoveSlot}
                 slotOrderIndex={selectedSlotOrderIndex}
@@ -2321,8 +1809,11 @@ export default function EditorPage() {
           >
         <Timeline
           slots={slots}
+          subtitleClips={subtitleClips}
+          ttsSegments={ttsSegments}
           assetMap={assetMap}
               templateVideoPath={templateVideoPath}
+              templateProxyPaths={templateProxyPaths}
               coverThumb={timelineCoverThumb}
               onCoverClick={() => {
                 const input = document.createElement('input');

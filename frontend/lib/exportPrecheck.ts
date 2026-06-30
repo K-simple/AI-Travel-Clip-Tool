@@ -28,7 +28,12 @@ export function buildExportPrecheck(
   slots: TemplateSlot[],
   assets: AssetLike[],
   templateProcessing: TemplateProcessingLike,
-  options?: { matching?: boolean; exporting?: boolean; capcutReplaceable?: boolean }
+  options?: {
+    matching?: boolean;
+    exporting?: boolean;
+    capcutReplaceable?: boolean;
+    subtitleRecognizing?: boolean;
+  }
 ): ExportPrecheckResult {
   const blockers: string[] = [];
   const warnings: string[] = [];
@@ -66,6 +71,10 @@ export function buildExportPrecheck(
 
   if (options?.exporting) {
     blockers.push('已有导出任务进行中，请等待完成');
+  }
+
+  if (options?.subtitleRecognizing) {
+    blockers.push('字幕识别进行中，请等待完成后再导出');
   }
 
   const unmatchedSlots = slots.filter((slot) => !isSlotFilled(slot));

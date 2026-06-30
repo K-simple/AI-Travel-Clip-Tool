@@ -7,6 +7,7 @@ export type SubtitleStyle = {
   position?: string;
   animation_in?: string;
   animation_out?: string;
+  animation_loop?: string;
   style_label?: string;
   confidence?: number;
 };
@@ -32,6 +33,14 @@ const ANIMATION_LABELS: Record<string, string> = {
   fade_down: '下滑',
   bounce: '弹跳',
   scale: '缩放',
+  scale_out: '缩小',
+  typewriter: '打字机',
+  blur_in: '模糊渐清',
+  blur_out: '模糊消失',
+  pulse: '呼吸',
+  shake: '抖动',
+  glow: '发光',
+  wave: '波浪',
   none: '无',
 };
 
@@ -59,7 +68,9 @@ export function parseSubtitleSegments(raw: unknown[] | undefined): SubtitleSegme
         styleRaw && typeof styleRaw === 'object'
           ? (styleRaw as SubtitleStyle)
           : undefined;
-      return { start, end, text, style };
+      const parsed: SubtitleSegment = { start, end, text };
+      if (style) parsed.style = style;
+      return parsed;
     })
     .filter((s): s is SubtitleSegment => s !== null);
 }
@@ -72,8 +83,28 @@ export function describeSubtitleStyle(style?: SubtitleStyle): string {
   if (style.animation_in) {
     parts.push(`入场 ${ANIMATION_LABELS[style.animation_in] || style.animation_in}`);
   }
+  if (style.animation_out && style.animation_out !== 'none') {
+    parts.push(`出场 ${ANIMATION_LABELS[style.animation_out] || style.animation_out}`);
+  }
+  if (style.animation_loop && style.animation_loop !== 'none') {
+    parts.push(`循环 ${ANIMATION_LABELS[style.animation_loop] || style.animation_loop}`);
+  }
   if (style.style_label) parts.push(style.style_label);
   return parts.join(' · ') || '已识别样式';
+}
+
+export function describeSubtitleSceneMatch(
+  score?: number,
+  reason?: string,
+  context?: string
+): string {
+  const bits: string[] = [];
+  if (context) bits.push(context);
+  if (score != null && Number.isFinite(score)) {
+    bits.push(`匹配度 ${Math.round(score * 100)}%`);
+  }
+  if (reason) bits.push(reason);
+  return bits.join(' · ');
 }
 
 export function describeSfxMarker(marker: SfxMarker): string {
@@ -93,9 +124,60 @@ export function getSlotRange(slot: TemplateSlot, fallbackStart: number): { start
 
 /** 槽位在模板源视频/人声上的起止时间（用于 Whisper 识别） */
 export function getSlotSourceTimeRange(slot: TemplateSlot): { start: number; end: number } {
-  const start = Math.max(0, Number(slot.clipStart ?? slot.slotStart ?? 0));
+  const start = Math.max(
+    0,
+    Number(slot.templateSourceStart ?? slot.clipStart ?? 0)
+  );
   const duration = Math.max(0.1, Number(slot.clip_duration ?? slot.duration ?? 0.1));
   return { start, end: start + duration };
+}
+
+/** 手改字幕时同步 subtitleText 与 subtitle_segments */
+export function syncSubtitleTextUpdate(
+  slot: TemplateSlot,
+  text: string
+): Pick<TemplateSlot, 'subtitleText' | 'subtitle_segments'> {
+  const trimmed = text;
+  const segments = parseSubtitleSegments(slot.subtitle_segments);
+  const duration = Math.max(0.1, slot.duration);
+  const sourceStart = getSlotSourceTimeRange(slot).start;
+
+  if (segments.length === 1) {
+    const seg = segments[0];
+    return {
+      subtitleText: trimmed,
+      subtitle_segments: [{ ...seg, text: trimmed }],
+    };
+  }
+
+  if (segments.length > 1 && trimmed.trim()) {
+    return {
+      subtitleText: trimmed,
+      subtitle_segments: [
+        {
+          start: sourceStart,
+          end: sourceStart + duration,
+          text: trimmed.trim(),
+          ...(segments[0]?.style ? { style: segments[0].style } : {}),
+        },
+      ],
+    };
+  }
+
+  if (!trimmed.trim()) {
+    return { subtitleText: '', subtitle_segments: [] };
+  }
+
+  return {
+    subtitleText: trimmed,
+    subtitle_segments: [
+      {
+        start: sourceStart,
+        end: sourceStart + duration,
+        text: trimmed.trim(),
+      },
+    ],
+  };
 }
 
 export function getSlotTimeRange(

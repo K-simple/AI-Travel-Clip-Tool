@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "note": "复制自 manifest.example.json；将样片放入 samples/ 后可用 --mode offline|api 跑分",
+  "cases": [
+    {
+      "id": "burned-travel-01",
+      "category": "burned_in",
+      "description": "烧录字幕旅游竖屏样片",
+      "template_video": "samples/burned-travel-01.mp4",
+      "expected_file": "expected/burned-travel-01.json",
+      "min_nonempty_rate": 0.9,
+      "max_duplicate_rate": 0.2
+    },
+    {
+      "id": "voiceover-01",
+      "category": "voiceover",
+      "description": "纯口播无烧录字幕",
+      "template_video": "samples/voiceover-01.mp4",
+      "expected_file": "expected/voiceover-01.json",
+      "min_nonempty_rate": 0.85
+    },
+    {
+      "id": "weak-audio-01",
+      "category": "weak_audio",
+      "description": "BGM 重、人声弱，允许部分空槽",
+      "template_video": "samples/weak-audio-01.mp4",
+      "expected_file": "expected/weak-audio-01.json",
+      "min_nonempty_rate": 0.5,
+      "allow_empty": true,
+      "max_duplicate_rate": 0.3
+    },
+    {
+      "id": "synthetic-smoke",
+      "category": "voiceover",
+      "description": "指标单测用期望（无 mp4，仅 check 模式可见 expected）",
+      "template_video": "samples/synthetic-smoke.mp4",
+      "expected_file": "expected/synthetic-smoke.json",
+      "min_nonempty_rate": 0.66
+    }
+  ]
+}

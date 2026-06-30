@@ -1,14 +1,6 @@
 'use client';
 
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ReactNode,
-  type RefObject,
-} from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { toMediaUrl } from '@/lib/api';
 import {
   ASPECT_RATIO_PRESETS,
@@ -25,28 +17,46 @@ import {
   type PreviewProxyPaths,
   type PreviewQualityId,
 } from '@/lib/previewSettings';
-import { parseSubtitleSegments } from '@/lib/slotEdit';
-import { buildClipLayouts, findClipAtTime, getTotalDuration } from '@/lib/timelineLayout';
+import { buildMainVideoClipLayouts, findClipAtTime, getTotalDuration, subtitleTextAtPlayheadGlobal } from '@/lib/timelineLayout';
+import { resolveMainTimelineSlots } from '@/lib/slotTimelineHelpers';
 import {
+  applyPreviewVideoAudio,
+  applyBgmPolicyTransition,
   findLayoutIndex,
   findNextPlayableIndex,
   isContiguousSameStream,
-  PREVIEW_CLIP_PRELOAD_LEAD,
   PREVIEW_CLIP_SWITCH_EPSILON,
+  PREVIEW_FRAME_SEC,
+  PREVIEW_PLAY_RATE_NUDGE_MAX,
+  PREVIEW_PLAY_SEEK_THRESHOLD,
   preparePreviewVideo,
+  resolveMasterTimelineTime,
+  resolvePreviewAudioPolicy,
   resolveSlotPreviewMedia,
+  seekVideoElement,
+  shouldPreloadNextPreviewSlot,
+  seekPreviewBgm,
+  syncPreviewVideoToSlot,
   timelineToVideoTime,
-  videoToTimelineTime,
+  unloadPreviewVideo,
+  type PreviewAudioPolicy,
+  type PreviewVideoSyncState,
+  type ResolvedPreviewAudio,
   type SlotPreviewMedia,
 } from '@/lib/previewPlayback';
-import type { TemplateSlot } from '@/lib/timeline';
+import type { SubtitleClip, TemplateSlot } from '@/lib/timeline';
 import { colorGradeToCssFilter } from '@/lib/slotEffects';
-import PublishPanel from '@/components/PublishPanel';
-import { capCutSetupSteps, REPLACEABLE_TEMPLATE_STEPS, type CapCutMateStatus } from '@/lib/capcutExport';
+import PreviewExportDrawer from '@/components/PreviewExportDrawer';
+import {
+  CompactMenu,
+  formatPreviewTimecode,
+  PauseIcon,
+  PlayIcon,
+  PREVIEW_FRAME_STEP,
+  useClickOutside,
+} from '@/lib/previewPanelUi';
+import { type CapCutMateStatus } from '@/lib/capcutExport';
 import { resolvePreviewMix, type TrackControls, type TrackKey, TRACK_KEYS, TRACK_LABELS } from '@/lib/trackControls';
-
-const FPS = 30;
-const FRAME_STEP = 1 / FPS;
 
 type AssetPreviewInfo = {
   filePath?: string;
@@ -57,6 +67,7 @@ type AssetPreviewInfo = {
 
 type PreviewPanelProps = {
   slots: TemplateSlot[];
+  subtitleClips?: SubtitleClip[];
   selectedSlot: TemplateSlot | null;
   playheadTime?: number;
   isPlaying?: boolean;
@@ -95,61 +106,9 @@ type PreviewPanelProps = {
   timelineName?: string;
 };
 
-function formatTimecode(seconds: number, fps = FPS): string {
-  const safe = Math.max(0, seconds);
-  const h = Math.floor(safe / 3600);
-  const m = Math.floor((safe % 3600) / 60);
-  const s = Math.floor(safe % 60);
-  const f = Math.floor((safe % 1) * fps);
-  const pad = (n: number, len = 2) => n.toString().padStart(len, '0');
-  return `${pad(h)}:${pad(m)}:${pad(s)}:${pad(f)}`;
-}
-
-function PlayIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
-      <path d="M8 5v14l11-7z" />
-    </svg>
-  );
-}
-
-function PauseIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
-      <path d="M6 5h4v14H6V5zm8 0h4v14h-4V5z" />
-    </svg>
-  );
-}
-
-function useClickOutside(
-  ref: RefObject<HTMLElement | null>,
-  open: boolean,
-  onClose: () => void
-) {
-  useEffect(() => {
-    if (!open) return;
-    const handler = (e: MouseEvent) => {
-      if (ref.current?.contains(e.target as Node)) return;
-      onClose();
-    };
-    document.addEventListener('mousedown', handler);
-    return () => document.removeEventListener('mousedown', handler);
-  }, [open, onClose, ref]);
-}
-
-function CompactMenu({ open, children, width }: { open: boolean; children: ReactNode; width: string }) {
-  if (!open) return null;
-  return (
-    <div
-      className={`absolute bottom-[calc(100%+4px)] right-0 z-40 overflow-hidden rounded-md border border-[#3a3a3c] bg-[#2a2a2c] py-0.5 shadow-lg ${width}`}
-    >
-      {children}
-    </div>
-  );
-}
-
 export default function PreviewPanel({
   slots,
+  subtitleClips = [],
   selectedSlot,
   playheadTime = 0,
   isPlaying = false,
@@ -193,12 +152,16 @@ export default function PreviewPanel({
   const layoutIndexRef = useRef(0);
   const preloadedNextRef = useRef(false);
   const backBufferReadyRef = useRef(false);
+  const lastBgmPolicyRef = useRef<ResolvedPreviewAudio | null>(null);
+  const playClockRef = useRef({ wall: 0, timeline: 0 });
+  const videoSyncStateRef = useRef<PreviewVideoSyncState>({ pendingKey: '' });
+  const lastSyncedIdxRef = useRef(-1);
   const playSessionRef = useRef(0);
   const lastPlayheadReportRef = useRef(-1);
   const onPlayheadChangeRef = useRef(onPlayheadChange);
   const bgmRef = useRef<HTMLAudioElement | null>(null);
-  const wasPlayingRef = useRef(false);
   const playheadRef = useRef(playheadTime);
+  const scrubSyncRafRef = useRef(0);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const qualityWrapRef = useRef<HTMLDivElement | null>(null);
@@ -245,7 +208,11 @@ export default function PreviewPanel({
   }, [trackControls]);
 
   const previewMix = useMemo(() => resolvePreviewMix(trackControls), [trackControls]);
-  const totalDuration = useMemo(() => getTotalDuration(slots), [slots]);
+  const mainTimelineSlots = useMemo(
+    () => resolveMainTimelineSlots(slots, subtitleClips),
+    [slots, subtitleClips]
+  );
+  const totalDuration = useMemo(() => getTotalDuration(mainTimelineSlots), [mainTimelineSlots]);
   const aspectPreset = ASPECT_RATIO_PRESETS.find((p) => p.id === aspectId) ?? ASPECT_RATIO_PRESETS[0];
   const stageAspectRatio =
     aspectId === 'auto' ? videoAspectRatio ?? aspectPreset.ratio : aspectPreset.ratio;
@@ -272,7 +239,10 @@ export default function PreviewPanel({
   const qualityPreset =
     PREVIEW_QUALITY_PRESETS.find((p) => p.id === qualityId) ?? PREVIEW_QUALITY_PRESETS[0];
 
-  const clipLayouts = useMemo(() => buildClipLayouts(slots, 1), [slots]);
+  const clipLayouts = useMemo(
+    () => buildMainVideoClipLayouts(slots, subtitleClips, 1),
+    [slots, subtitleClips]
+  );
 
   const activeLayout = useMemo(
     () => findClipAtTime(clipLayouts, playheadTime),
@@ -362,6 +332,11 @@ export default function PreviewPanel({
   const finalExportUrl = exportUrl ? toMediaUrl(exportUrl) : '';
   const previewSrc = finalExportUrl || assetUrl;
   const useLowResPosterForPlay = !finalExportUrl && previewStream.isPoster;
+  /** 播放中强制走 video 元素，避免缩略图占位导致无画面/无法切镜 */
+  const blockVideoForPoster = (useLowResPoster || useLowResPosterForPlay) && !isPlaying;
+  const hasPreviewVideo = Boolean(
+    previewSrc || (!finalExportUrl && templateVideoPath && previewMix.showVideo)
+  );
 
   useEffect(() => {
     setAspectId('auto');
@@ -405,6 +380,81 @@ export default function PreviewPanel({
     previewMix.showVideo,
   ]);
 
+  const slotsMediaKey = useMemo(
+    () =>
+      slots
+        .map(
+          (slot) =>
+            `${slot.id}:${slot.matchedAssetId ?? ''}:${slot.asset_file_path ?? ''}:${slot.clipStart}:${slot.useOriginalAudio ? 1 : 0}`
+        )
+        .join('|'),
+    [slots]
+  );
+
+  const resolveSlotAudio = useCallback(
+    (slot: TemplateSlot | null | undefined) =>
+      resolvePreviewAudioPolicy({
+        useOriginalAudio: Boolean(slot?.useOriginalAudio),
+        hasMatchedAsset: Boolean(slot?.asset_file_path || slot?.matchedAssetId),
+        templateMusicEnabled,
+        hasTemplateAudioUrl: Boolean(templateAudioUrl),
+        hasTemplateVideoPath: Boolean(templateVideoPath),
+        previewMix,
+      }),
+    [templateMusicEnabled, templateAudioUrl, templateVideoPath, previewMix]
+  );
+
+  const previewAudio = useMemo(
+    () => resolveSlotAudio(activeLayout?.slot ?? displaySlot),
+    [activeLayout?.slot, displaySlot, resolveSlotAudio]
+  );
+
+  const previewAudioPolicyKey = useMemo(() => {
+    const p = previewAudio;
+    return `${Number(p.playTemplateBgm)}:${Number(p.playClipAudio)}:${Number(p.playTemplateVideoAudio)}:${Number(p.muteVideo)}`;
+  }, [previewAudio]);
+
+  const mutedBackBufferPolicy = useMemo<PreviewAudioPolicy>(
+    () => ({ muteVideo: true, videoVolume: 0 }),
+    []
+  );
+
+  // 仅槽位素材变化时重置预览缓冲（勿依赖 previewAudio，否则跨段播放会误触发卸载）
+  useEffect(() => {
+    playSessionRef.current += 1;
+    preloadedNextRef.current = false;
+    backBufferReadyRef.current = false;
+    lastBgmPolicyRef.current = null;
+    videoSyncStateRef.current.pendingKey = '';
+    playClockRef.current = { wall: 0, timeline: 0 };
+    lastSyncedIdxRef.current = -1;
+    layoutIndexRef.current = findLayoutIndex(clipLayouts, playheadRef.current);
+    [videoRefA.current, videoRefB.current].forEach((video) => {
+      if (!video) return;
+      unloadPreviewVideo(video);
+    });
+
+    const bgm = bgmRef.current;
+    if (bgm && templateAudioUrl && !finalExportUrl) {
+      bgm.pause();
+      const idx = findLayoutIndex(clipLayouts, playheadRef.current);
+      const slot = clipLayouts[idx]?.slot ?? null;
+      applyBgmPolicyTransition(
+        bgm,
+        resolveSlotAudio(slot),
+        lastBgmPolicyRef.current,
+        playheadRef.current,
+        false
+      );
+      lastBgmPolicyRef.current = resolveSlotAudio(slot);
+      try {
+        bgm.currentTime = playheadRef.current;
+      } catch {
+        /* ignore */
+      }
+    }
+  }, [slotsMediaKey, templateAudioUrl, finalExportUrl, resolveSlotAudio, clipLayouts]);
+
   const videoPreload = previewPreloadForQuality(qualityId);
 
   const setLayerVisibility = useCallback((front: 0 | 1) => {
@@ -416,12 +466,20 @@ export default function PreviewPanel({
       el.style.opacity = active ? '1' : '0';
       el.style.zIndex = active ? '2' : '1';
       el.style.filter = active ? el.dataset.filter || '' : '';
+      if (!active) {
+        applyPreviewVideoAudio(el, { muteVideo: true, videoVolume: 0 });
+      }
     });
   }, []);
 
   const prepareVideoEl = useCallback(
-    (el: HTMLVideoElement, media: SlotPreviewMedia, videoTime: number, autoplay: boolean) =>
-      preparePreviewVideo(el, media, videoTime, autoplay),
+    (
+      el: HTMLVideoElement,
+      media: SlotPreviewMedia,
+      videoTime: number,
+      autoplay: boolean,
+      audio?: PreviewAudioPolicy
+    ) => preparePreviewVideo(el, media, videoTime, autoplay, audio),
     []
   );
 
@@ -433,142 +491,258 @@ export default function PreviewPanel({
     playheadRef.current = playheadTime;
   }, [playheadTime]);
 
-  const slotUsesOriginalAudio = Boolean(displaySlot?.useOriginalAudio) && previewMix.audioAudible;
-  const activeUsesTemplateVideo = Boolean(
-    displaySlot &&
-      !displaySlot.matchedAssetId &&
-      !displaySlot.asset_file_path?.trim() &&
-      templateVideoPath
+  const { muteVideo: muteVideoAudio } = previewAudio;
+
+  const applyFrontPreviewAudio = useCallback(
+    (policy = previewAudio) => {
+      const front = frontLayerRef.current === 0 ? videoRefA.current : videoRefB.current;
+      const back = frontLayerRef.current === 0 ? videoRefB.current : videoRefA.current;
+      if (front) applyPreviewVideoAudio(front, policy);
+      if (back) applyPreviewVideoAudio(back, mutedBackBufferPolicy);
+    },
+    [previewAudio, mutedBackBufferPolicy]
   );
-  const playTemplateBgm =
-    templateMusicEnabled && !!templateAudioUrl && previewMix.audioAudible && !slotUsesOriginalAudio;
-  const playTemplateVideoAudio =
-    !playTemplateBgm &&
-    activeUsesTemplateVideo &&
-    previewMix.audioAudible &&
-    previewMix.videoAudible &&
-    !slotUsesOriginalAudio;
-  const playClipAudio = slotUsesOriginalAudio && previewMix.videoAudible;
-  const muteVideoAudio = playTemplateBgm || (!playClipAudio && !playTemplateVideoAudio);
 
   useEffect(() => {
-    [videoRefA.current, videoRefB.current].forEach((video) => {
-      if (!video) return;
-      video.muted = muteVideoAudio;
-      video.volume = playClipAudio || playTemplateVideoAudio ? 0.9 : 0;
-    });
-  }, [muteVideoAudio, playClipAudio, playTemplateVideoAudio]);
+    if (isPlaying || finalExportUrl) return;
+    applyFrontPreviewAudio();
+  }, [applyFrontPreviewAudio, finalExportUrl, isPlaying]);
 
-  // 暂停/拖拽：同步前台视频
+  // 暂停/拖拽：每帧合并一次同步，避免逐像素 seek 卡顿；BGM 跟播放头不走 0 点
   useEffect(() => {
     if (isPlaying || finalExportUrl || !slotMedias.some(Boolean)) return;
 
-    const idx = findLayoutIndex(clipLayouts, playheadTime);
-    const media = slotMedias[idx];
-    if (!media) return;
+    cancelAnimationFrame(scrubSyncRafRef.current);
+    scrubSyncRafRef.current = requestAnimationFrame(() => {
+      const t = playheadTime;
+      const idx = findLayoutIndex(clipLayouts, t);
+      const media = slotMedias[idx];
+      if (!media) return;
 
-    layoutIndexRef.current = idx;
-    preloadedNextRef.current = false;
-    backBufferReadyRef.current = false;
-    const front = frontLayerRef.current === 0 ? videoRefA.current : videoRefB.current;
-    if (!front) return;
+      if (idx !== layoutIndexRef.current) {
+        preloadedNextRef.current = false;
+        backBufferReadyRef.current = false;
+        videoSyncStateRef.current.pendingKey = '';
+      }
+      layoutIndexRef.current = idx;
+      lastSyncedIdxRef.current = idx;
 
-    void prepareVideoEl(front, media, timelineToVideoTime(media, playheadTime), false).then(() => {
-      front.pause();
-      setLayerVisibility(frontLayerRef.current);
+      const front = frontLayerRef.current === 0 ? videoRefA.current : videoRefB.current;
+      if (!front) return;
+
+      const policy = resolveSlotAudio(media.layout.slot);
+      seekPreviewBgm(bgmRef.current, policy, t);
+
+      void syncPreviewVideoToSlot(
+        front,
+        media,
+        t,
+        policy,
+        videoSyncStateRef.current,
+        { autoplay: false, seekEpsilon: PREVIEW_FRAME_SEC }
+      ).then(() => {
+        setLayerVisibility(frontLayerRef.current);
+      });
     });
-  }, [clipLayouts, finalExportUrl, isPlaying, playheadTime, prepareVideoEl, setLayerVisibility, slotMedias]);
 
-  // 播放：双缓冲切镜；勿将 playheadTime 放入依赖，避免每帧重启导致抽搐
+    return () => cancelAnimationFrame(scrubSyncRafRef.current);
+  }, [clipLayouts, finalExportUrl, isPlaying, playheadTime, resolveSlotAudio, setLayerVisibility, slotMedias]);
+
+  // 播放：BGM/墙钟驱动时间轴，视频跟随时间轴切镜（全程连续，无需手动切下一段）
   useEffect(() => {
     if (!isPlaying || finalExportUrl || !slotMedias.some(Boolean)) return;
 
     const session = ++playSessionRef.current;
     let raf = 0;
 
+    playClockRef.current = { wall: performance.now(), timeline: playheadRef.current };
+    videoSyncStateRef.current.pendingKey = '';
+
     const reportPlayhead = (time: number) => {
-      if (Math.abs(time - lastPlayheadReportRef.current) < 1 / 30) return;
+      if (Math.abs(time - lastPlayheadReportRef.current) < 1 / 15) return;
       lastPlayheadReportRef.current = time;
       playheadRef.current = time;
       onPlayheadChangeRef.current?.(time);
     };
 
+    const getFrontEl = () =>
+      frontLayerRef.current === 0 ? videoRefA.current : videoRefB.current;
+    const getBackEl = () =>
+      frontLayerRef.current === 0 ? videoRefB.current : videoRefA.current;
+
     const tick = () => {
       if (session !== playSessionRef.current) return;
 
-      const frontEl = frontLayerRef.current === 0 ? videoRefA.current : videoRefB.current;
+      const frontEl = getFrontEl();
       if (!frontEl) {
         raf = requestAnimationFrame(tick);
         return;
       }
 
-      const idx = layoutIndexRef.current;
-      const media = slotMedias[idx];
+      const bgm = bgmRef.current;
+      let idx = layoutIndexRef.current;
+      let media = slotMedias[idx];
       if (!media) {
         raf = requestAnimationFrame(tick);
         return;
       }
 
-      const timelineT = videoToTimelineTime(media, frontEl.currentTime);
+      let policy = resolveSlotAudio(media.layout.slot);
+
+      let timelineT = resolveMasterTimelineTime({
+        playing: true,
+        media,
+        frontEl,
+        policy,
+        clock: playClockRef.current,
+        fallbackTime: playheadRef.current,
+        totalDuration,
+      });
+
+      // 原声槽位：视频播完自动进入下一段
+      if (policy.playClipAudio && frontEl.ended) {
+        const nextIdx = findNextPlayableIndex(slotMedias, idx);
+        const nextMedia = nextIdx >= 0 ? slotMedias[nextIdx] : null;
+        if (nextMedia && timelineT >= media.layout.end - PREVIEW_CLIP_SWITCH_EPSILON) {
+          timelineT = nextMedia.layout.start;
+        }
+      }
+
+      idx = findLayoutIndex(clipLayouts, timelineT);
+      layoutIndexRef.current = idx;
+      media = slotMedias[idx];
+      if (!media) {
+        raf = requestAnimationFrame(tick);
+        return;
+      }
+
+      policy = resolveSlotAudio(media.layout.slot);
       reportPlayhead(timelineT);
+      applyBgmPolicyTransition(bgm, policy, lastBgmPolicyRef.current, timelineT, true);
+      lastBgmPolicyRef.current = policy;
+
+      const backEl = getBackEl();
+      if (backEl) {
+        applyPreviewVideoAudio(backEl, mutedBackBufferPolicy);
+      }
 
       const nextIdx = findNextPlayableIndex(slotMedias, idx);
       const nextMedia = nextIdx >= 0 ? slotMedias[nextIdx] : null;
-      const switchAt = media.layout.end - PREVIEW_CLIP_SWITCH_EPSILON;
-      const preloadAt = media.layout.end - PREVIEW_CLIP_PRELOAD_LEAD;
 
       if (
         nextMedia &&
+        backEl &&
         !isContiguousSameStream(media, nextMedia) &&
-        timelineT >= preloadAt &&
+        shouldPreloadNextPreviewSlot(media, timelineT) &&
         !preloadedNextRef.current
       ) {
         preloadedNextRef.current = true;
         backBufferReadyRef.current = false;
-        const backIdx = (1 - frontLayerRef.current) as 0 | 1;
-        const backEl = backIdx === 0 ? videoRefA.current : videoRefB.current;
-        if (backEl) {
-          void prepareVideoEl(
-            backEl,
-            nextMedia,
-            timelineToVideoTime(nextMedia, nextMedia.layout.start),
-            true
+        void prepareVideoEl(
+          backEl,
+          nextMedia,
+          timelineToVideoTime(nextMedia, nextMedia.layout.start),
+          true,
+          mutedBackBufferPolicy
+        )
+          .then(() => {
+            if (session === playSessionRef.current) {
+              applyPreviewVideoAudio(backEl, mutedBackBufferPolicy);
+              backBufferReadyRef.current = true;
+            }
+          })
+          .catch(() => {
+            if (session === playSessionRef.current) {
+              preloadedNextRef.current = false;
+              backBufferReadyRef.current = false;
+            }
+          });
+      }
+
+      const targetVideoT = timelineToVideoTime(media, timelineT);
+      const streamMismatch = frontEl.dataset.stream !== media.streamUrl;
+      const idxChanged = lastSyncedIdxRef.current !== idx;
+      const prevMedia =
+        lastSyncedIdxRef.current >= 0 ? slotMedias[lastSyncedIdxRef.current] : null;
+      const contiguousHandoff =
+        idxChanged &&
+        prevMedia &&
+        !streamMismatch &&
+        isContiguousSameStream(prevMedia, media) &&
+        Math.abs(frontEl.currentTime - targetVideoT) <= 0.2;
+      const backReady =
+        backBufferReadyRef.current &&
+        backEl &&
+        backEl.dataset.stream === media.streamUrl;
+      const canSwapBack =
+        backReady && backEl && backEl.dataset.stream === media.streamUrl;
+      const needsVideoSync =
+        !contiguousHandoff &&
+        (idxChanged ||
+          streamMismatch ||
+          frontEl.ended ||
+          Math.abs(frontEl.currentTime - targetVideoT) > PREVIEW_PLAY_SEEK_THRESHOLD);
+
+      const drift = targetVideoT - frontEl.currentTime;
+      const canRateNudge =
+        !policy.playClipAudio &&
+        !contiguousHandoff &&
+        !idxChanged &&
+        !streamMismatch &&
+        !frontEl.ended &&
+        Math.abs(drift) > PREVIEW_FRAME_SEC &&
+        Math.abs(drift) <= PREVIEW_PLAY_RATE_NUDGE_MAX;
+
+      if (contiguousHandoff) {
+        frontEl.playbackRate = 1;
+        lastSyncedIdxRef.current = idx;
+        applyPreviewVideoAudio(frontEl, policy);
+        if (frontEl.paused && !frontEl.ended) {
+          void frontEl.play().catch(() => undefined);
+        }
+      } else if (canRateNudge && !needsVideoSync) {
+        frontEl.playbackRate = drift > 0 ? Math.min(1.12, 1 + drift * 0.35) : Math.max(0.88, 1 + drift * 0.35);
+        applyPreviewVideoAudio(frontEl, policy);
+        if (frontEl.paused && !frontEl.ended) {
+          void frontEl.play().catch(() => undefined);
+        }
+      } else if (needsVideoSync) {
+        frontEl.playbackRate = 1;
+        if ((streamMismatch || idxChanged) && canSwapBack) {
+          frontLayerRef.current = (1 - frontLayerRef.current) as 0 | 1;
+          frontEl.pause();
+          applyPreviewVideoAudio(frontEl, mutedBackBufferPolicy);
+          backEl.dataset.filter = media.cssFilter || '';
+          applyPreviewVideoAudio(backEl, policy);
+          setLayerVisibility(frontLayerRef.current);
+          preloadedNextRef.current = false;
+          backBufferReadyRef.current = false;
+          lastSyncedIdxRef.current = idx;
+          if (backEl.paused) {
+            void backEl.play().catch(() => undefined);
+          }
+        } else {
+          if (idxChanged) {
+            videoSyncStateRef.current.pendingKey = '';
+          }
+          void syncPreviewVideoToSlot(
+            frontEl,
+            media,
+            timelineT,
+            policy,
+            videoSyncStateRef.current,
+            { autoplay: true, seekEpsilon: PREVIEW_PLAY_SEEK_THRESHOLD }
           ).then(() => {
             if (session === playSessionRef.current) {
-              backBufferReadyRef.current = true;
+              lastSyncedIdxRef.current = idx;
             }
           });
         }
-      }
-
-      if (nextMedia && timelineT >= switchAt) {
-        if (isContiguousSameStream(media, nextMedia)) {
-          layoutIndexRef.current = nextIdx;
-          preloadedNextRef.current = false;
-          backBufferReadyRef.current = false;
-          if (nextMedia.cssFilter !== media.cssFilter) {
-            frontEl.dataset.filter = nextMedia.cssFilter || '';
-          }
-        } else if (backBufferReadyRef.current) {
-          const backIdx = (1 - frontLayerRef.current) as 0 | 1;
-          frontLayerRef.current = backIdx;
-          layoutIndexRef.current = nextIdx;
-          preloadedNextRef.current = false;
-          backBufferReadyRef.current = false;
-
-          const newFront = backIdx === 0 ? videoRefA.current : videoRefB.current;
-          if (newFront) {
-            newFront.dataset.filter = nextMedia.cssFilter || '';
-            if (newFront.paused) {
-              void prepareVideoEl(
-                newFront,
-                nextMedia,
-                timelineToVideoTime(nextMedia, nextMedia.layout.start),
-                true
-              );
-            }
-          }
-          setLayerVisibility(backIdx);
+      } else {
+        frontEl.playbackRate = 1;
+        applyPreviewVideoAudio(frontEl, policy);
+        if (frontEl.paused && !frontEl.ended) {
+          void frontEl.play().catch(() => undefined);
         }
       }
 
@@ -586,106 +760,64 @@ export default function PreviewPanel({
     preloadedNextRef.current = false;
     backBufferReadyRef.current = false;
     lastPlayheadReportRef.current = -1;
-    const startMedia = slotMedias[startIdx];
-    const frontEl = frontLayerRef.current === 0 ? videoRefA.current : videoRefB.current;
+    lastBgmPolicyRef.current = null;
+    lastSyncedIdxRef.current = startIdx;
 
-    if (startMedia && frontEl) {
-      void prepareVideoEl(
-        frontEl,
-        startMedia,
-        timelineToVideoTime(startMedia, playheadRef.current),
-        true
-      ).then(() => {
-        if (session !== playSessionRef.current) return;
-        setLayerVisibility(frontLayerRef.current);
-        raf = requestAnimationFrame(tick);
-      });
-    } else {
-      raf = requestAnimationFrame(tick);
+    const startMedia = slotMedias[startIdx];
+
+    raf = requestAnimationFrame(tick);
+
+    if (startMedia) {
+      const startPolicy = resolveSlotAudio(startMedia.layout.slot);
+      const bgm = bgmRef.current;
+      if (startPolicy.playTemplateBgm && bgm) {
+        try {
+          bgm.currentTime = playheadRef.current;
+        } catch {
+          /* ignore */
+        }
+        bgm.volume = 0.85;
+        bgm.muted = false;
+        void bgm.play().catch(() => undefined);
+        lastBgmPolicyRef.current = startPolicy;
+      }
     }
 
     return () => {
       playSessionRef.current += 1;
       if (raf) cancelAnimationFrame(raf);
+      videoSyncStateRef.current.pendingKey = '';
       [videoRefA.current, videoRefB.current].forEach((v) => v?.pause());
     };
   }, [
     clipLayouts,
     finalExportUrl,
     isPlaying,
+    mutedBackBufferPolicy,
     prepareVideoEl,
+    resolveSlotAudio,
     setLayerVisibility,
     slotMedias,
     totalDuration,
   ]);
 
-  // 暂停/拖拽时同步 BGM 到播放头；播放中不逐帧 seek，避免爆音
   useEffect(() => {
-    if (!bgmRef.current || !templateAudioUrl || finalExportUrl || isPlaying) return;
-    const audio = bgmRef.current;
-    try {
-      if (Math.abs(audio.currentTime - playheadTime) > 0.05) {
-        audio.currentTime = playheadTime;
-      }
-    } catch {
-      /* ignore */
-    }
-  }, [templateAudioUrl, playheadTime, finalExportUrl, isPlaying]);
-
-  useEffect(() => {
-    if (!bgmRef.current || finalExportUrl) return;
-    const audio = bgmRef.current;
-    audio.volume = playTemplateBgm ? 0.85 : 0;
-    audio.muted = !playTemplateBgm;
-
-    if (isPlaying && playTemplateBgm) {
-      if (!wasPlayingRef.current) {
-        try {
-          audio.currentTime = playheadTime;
-        } catch {
-          /* ignore */
-        }
-      }
-      void audio.play().catch(() => undefined);
-    } else {
-      audio.pause();
-    }
-    wasPlayingRef.current = isPlaying;
-  }, [isPlaying, playTemplateBgm, templateAudioUrl, finalExportUrl, playheadTime]);
-
-  // 播放中仅在大偏差时校正 BGM，防止与 RAF 时钟长期漂移
-  useEffect(() => {
-    if (!isPlaying || !playTemplateBgm) return;
-    const audio = bgmRef.current;
-    if (!audio) return;
-
-    const id = window.setInterval(() => {
-      if (audio.paused) return;
-      try {
-        const drift = Math.abs(audio.currentTime - playheadRef.current);
-        if (drift > 0.35) {
-          audio.currentTime = playheadRef.current;
-        }
-      } catch {
-        /* ignore */
-      }
-    }, 500);
-
-    return () => window.clearInterval(id);
-  }, [isPlaying, playTemplateBgm]);
+    if (!bgmRef.current || finalExportUrl || isPlaying) return;
+    applyBgmPolicyTransition(
+      bgmRef.current,
+      previewAudio,
+      lastBgmPolicyRef.current,
+      playheadRef.current,
+      false
+    );
+    lastBgmPolicyRef.current = previewAudio;
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed by previewAudioPolicyKey
+  }, [finalExportUrl, isPlaying, previewAudioPolicyKey, templateAudioUrl]);
 
   const subtitleText = useMemo(() => {
-    if (!previewMix.showSubtitle || !displaySlot || !activeLayout) return '';
-    const segments = parseSubtitleSegments(displaySlot.subtitle_segments);
-    if (segments.length) {
-      const hit = segments.find((s) => playheadTime >= s.start && playheadTime < s.end);
-      return hit?.text ?? '';
-    }
-    if (playheadTime >= activeLayout.start && playheadTime < activeLayout.end) {
-      return displaySlot.subtitleText || '';
-    }
-    return '';
-  }, [previewMix.showSubtitle, displaySlot, activeLayout, playheadTime]);
+    if (!previewMix.showSubtitle) return '';
+    return subtitleTextAtPlayheadGlobal(slots, playheadTime, subtitleClips);
+  }, [previewMix.showSubtitle, slots, playheadTime, subtitleClips]);
 
   const handleQualityChange = useCallback((next: PreviewQualityId) => {
     setQualityId(next);
@@ -757,7 +889,7 @@ export default function PreviewPanel({
         <div
           ref={stageRef}
           className="relative isolate shrink-0 overflow-hidden bg-black shadow-[0_0_0_1px_#2a2a2c]"
-          style={{
+              style={{
             width: stageSize.width > 0 ? stageSize.width : undefined,
             height: stageSize.height > 0 ? stageSize.height : undefined,
             aspectRatio: stageSize.width > 0 ? undefined : String(stageAspectRatio),
@@ -776,7 +908,7 @@ export default function PreviewPanel({
               {previewStream.isFallback ? (
                 <span className="ml-1 text-[#face15]">({qualityPreset.label})</span>
               ) : null}
-            </div>
+          </div>
           ) : null}
 
           {useLowResPoster ? (
@@ -788,13 +920,13 @@ export default function PreviewPanel({
           ) : null}
 
           {finalExportUrl ? (
-            <video
+                <video
               src={finalExportUrl}
               playsInline
-              controls
+                  controls
               className={previewMediaClass}
             />
-          ) : previewSrc && !useLowResPoster && !useLowResPosterForPlay ? (
+          ) : hasPreviewVideo && !blockVideoForPoster ? (
             <>
               <video
                 ref={videoRefA}
@@ -820,7 +952,7 @@ export default function PreviewPanel({
                 }}
               />
             </>
-          ) : useLowResPoster || useLowResPosterForPlay ? (
+          ) : blockVideoForPoster ? (
             // eslint-disable-next-line @next/next/no-img-element
             <img
               src={templateThumbUrl || overlayThumbUrl}
@@ -833,7 +965,7 @@ export default function PreviewPanel({
           ) : (
             <div className="flex h-full min-h-[200px] w-full min-w-[120px] items-center justify-center bg-black text-xs text-[#555]">
               {!previewMix.showVideo ? '视频轨已隐藏' : '匹配素材后预览'}
-            </div>
+              </div>
           )}
 
           {showOverlayPreview ? (
@@ -856,23 +988,23 @@ export default function PreviewPanel({
               >
                 {subtitleText}
               </p>
-            </div>
+              </div>
           ) : null}
 
           {templateAudioUrl && !finalExportUrl ? (
             // eslint-disable-next-line jsx-a11y/media-has-caption
             <audio ref={bgmRef} src={toMediaUrl(templateAudioUrl)} preload="auto" className="hidden" />
           ) : null}
-        </div>
-      </div>
+              </div>
+              </div>
 
       <div className="relative flex shrink-0 flex-wrap items-center justify-between gap-2 border-t border-editor-border bg-editor-panel-2/60 px-2 py-2 sm:flex-nowrap sm:px-3">
         <div className="flex min-w-0 flex-1 items-center gap-1.5 sm:gap-2">
           <span className="font-mono text-[13px] font-medium tabular-nums text-[#5ec8d8]">
-            {formatTimecode(playheadTime)}
+            {formatPreviewTimecode(playheadTime)}
           </span>
           <span className="font-mono text-[13px] tabular-nums text-[#8e8e93]">
-            {formatTimecode(totalDuration)}
+            {formatPreviewTimecode(totalDuration)}
           </span>
           <div ref={trackListRef} className="relative">
             <button
@@ -902,12 +1034,12 @@ export default function PreviewPanel({
                 </div>
               ))}
             </CompactMenu>
-          </div>
+                </div>
           {onPlayheadStep ? (
             <>
               <button
                 type="button"
-                onClick={() => onPlayheadStep(-FRAME_STEP)}
+                onClick={() => onPlayheadStep(-PREVIEW_FRAME_STEP)}
                 className="flex h-6 w-6 items-center justify-center rounded text-[#6e6e72] hover:bg-[#2a2a2c] hover:text-[#b8b8bc]"
                 title="上一帧"
               >
@@ -915,7 +1047,7 @@ export default function PreviewPanel({
               </button>
               <button
                 type="button"
-                onClick={() => onPlayheadStep(FRAME_STEP)}
+                onClick={() => onPlayheadStep(PREVIEW_FRAME_STEP)}
                 className="flex h-6 w-6 items-center justify-center rounded text-[#6e6e72] hover:bg-[#2a2a2c] hover:text-[#b8b8bc]"
                 title="下一帧"
               >
@@ -923,7 +1055,7 @@ export default function PreviewPanel({
               </button>
             </>
           ) : null}
-        </div>
+                </div>
 
         <button
           type="button"
@@ -982,7 +1114,7 @@ export default function PreviewPanel({
                 );
               })}
             </CompactMenu>
-          </div>
+                </div>
 
           <button
             type="button"
@@ -1027,7 +1159,7 @@ export default function PreviewPanel({
                     {a.label}
                   </button>
                 ))}
-              </div>
+            </div>
             </CompactMenu>
           </div>
 
@@ -1041,190 +1173,32 @@ export default function PreviewPanel({
               <path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5" />
             </svg>
           </button>
-        </div>
+          </div>
       </div>
 
-      {menuOpen ? (
-        <div className="absolute inset-y-0 right-0 z-20 flex w-[min(280px,85%)] flex-col border-l border-[#2a2a2c] bg-[#1e1e20] shadow-2xl">
-          <div className="flex items-center justify-between border-b border-[#2a2a2c] px-3 py-2">
-            <span className="text-xs font-medium text-[#e5e5ea]">导出与发布</span>
-            <button type="button" onClick={() => setMenuOpen(false)} className="text-[#8e8e93] hover:text-white">
-              ✕
-            </button>
-          </div>
-          <div className="flex-1 overflow-y-auto p-3">
-            <label className="mb-3 flex items-center gap-2 text-[11px] text-[#8b8b8b]">
-              <input
-                type="checkbox"
-                checked={addSubtitles}
-                onChange={(e) => onAddSubtitlesChange?.(e.target.checked)}
-                className="accent-[#face15]"
-              />
-              导出时烧录字幕
-            </label>
-            <label className="mb-3 flex flex-col gap-1 text-[11px] text-[#8b8b8b]">
-              导出分辨率
-              <select
-                value={exportResolution}
-                onChange={(e) => onExportResolutionChange?.(e.target.value)}
-                className="rounded border border-[#3a3a3c] bg-[#141416] px-2 py-1.5 text-xs text-[#e5e5e5]"
-              >
-                <option value="1080x1920">1080×1920</option>
-                <option value="2160x3840">4K 竖屏</option>
-                <option value="3840x2160">4K 横屏</option>
-              </select>
-            </label>
-            {finalExportUrl ? (
-              <a
-                href={finalExportUrl}
-                target="_blank"
-                rel="noreferrer"
-                className="mb-3 block rounded bg-[#2a2a2c] py-2 text-center text-xs text-[#face15] hover:bg-[#333]"
-              >
-                下载导出视频 →
-              </a>
-            ) : null}
-            {onExport ? (
-              <button
-                type="button"
-                disabled={!canExport || exporting}
-                onClick={onExport}
-                className="mb-3 w-full rounded bg-[#face15] py-2 text-xs font-semibold text-black hover:bg-[#ffe066] disabled:cursor-not-allowed disabled:bg-[#665c20] disabled:text-[#999]"
-              >
-                {exporting ? `导出中… ${exportProgress > 0 ? `${exportProgress}%` : ''}` : '开始导出'}
-              </button>
-            ) : null}
-            {onExportCapCut ? (
-              <>
-                {onCapCutReplaceableModeChange ? (
-                  <label className="mb-2 flex cursor-pointer items-start gap-2 rounded border border-[#3a3a3c] bg-[#1a1a1c] px-2 py-2 text-[10px] leading-relaxed text-[#b0b0b0]">
-                    <input
-                      type="checkbox"
-                      checked={capCutReplaceableMode}
-                      onChange={(e) => onCapCutReplaceableModeChange(e.target.checked)}
-                      className="mt-0.5 shrink-0"
-                    />
-                    <span>
-                      <span className="font-medium text-[#e5e5e5]">可替换模板</span>
-                      <span className="block text-[#8b8b8b]">
-                        导出模板占位片段与槽位标签，在剪映中逐段「替换素材」套用你的成片
-                      </span>
-                    </span>
-                  </label>
-                ) : null}
-                <button
-                  type="button"
-                  disabled={!canExport || capCutExporting || exporting || capCutMateStatus?.ready === false}
-                  onClick={onExportCapCut}
-                  className="mb-2 w-full rounded border border-[#face15]/40 bg-[#2a2a2c] py-2 text-xs font-medium text-[#face15] hover:bg-[#333] disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {capCutExporting
-                    ? `生成剪映草稿… ${capCutExportProgress > 0 ? `${capCutExportProgress}%` : ''}`
-                    : capCutReplaceableMode
-                      ? '导出可替换模板草稿'
-                      : '导出剪映草稿（成片）'}
-                </button>
-                {capCutExporting ? (
-                  <div className="mb-3 h-1.5 overflow-hidden rounded bg-[#1a3a1a]">
-                    <div
-                      className={`h-full transition-all ${capCutExportProgress <= 0 ? 'w-1/3 animate-pulse bg-[#face15]/60' : 'bg-[#4ade80]'}`}
-                      style={
-                        capCutExportProgress > 0
-                          ? { width: `${Math.max(5, capCutExportProgress)}%` }
-                          : undefined
-                      }
-                    />
-                  </div>
-                ) : null}
-                {capCutMateStatus && !capCutMateStatus.ready ? (
-                  <div className="mb-3 rounded border border-[#5c3a20] bg-[#2a1f14] px-2 py-2 text-[10px] leading-relaxed text-[#fbbf24]">
-                    <div className="mb-1 flex items-center justify-between gap-2">
-                      <p className="font-medium">剪映小助手未就绪</p>
-                      {onRefreshCapCutMate ? (
-                        <button
-                          type="button"
-                          onClick={onRefreshCapCutMate}
-                          className="shrink-0 rounded bg-[#3a2a14] px-2 py-0.5 text-[9px] text-[#face15] hover:bg-[#4a3518]"
-                        >
-                          重新检测
-                        </button>
-                      ) : null}
-                    </div>
-                    <ul className="list-inside list-disc space-y-0.5 text-[#d4a574]">
-                      {capCutSetupSteps(capCutMateStatus).map((step) => (
-                        <li key={step}>{step}</li>
-                      ))}
-                    </ul>
-                  </div>
-                ) : capCutMateStatus?.ready ? (
-                  <p className="mb-3 text-[10px] text-[#4ade80]">剪映小助手已连接</p>
-                ) : null}
-              </>
-            ) : null}
-            {capCutStatus ? (
-              <p
-                className={`mb-3 text-[10px] leading-relaxed ${
-                  capCutDraftUrl
-                    ? 'rounded border border-[#2d4a2d] bg-[#142014] px-2 py-2 text-[#4ade80]'
-                    : capCutExporting
-                      ? 'text-[#face15]'
-                      : 'rounded border border-[#4a2020] bg-[#2a1414] px-2 py-2 text-[#f87171]'
-                }`}
-              >
-                {capCutStatus}
-              </p>
-            ) : null}
-            {capCutDraftUrl ? (
-              <div className="mb-3 space-y-2">
-                <button
-                  type="button"
-                  onClick={onOpenCapCutDraft}
-                  className="w-full rounded bg-[#face15] py-2 text-xs font-semibold text-black hover:bg-[#ffe066]"
-                >
-                  在剪映中打开草稿
-                </button>
-                <button
-                  type="button"
-                  onClick={onOpenCapCutDraft}
-                  className="w-full rounded border border-[#444] bg-[#2a2a2c] py-2 text-[10px] text-[#ccc] hover:bg-[#333]"
-                >
-                  重新安装到剪映
-                </button>
-                <p className="text-[10px] leading-relaxed text-[#6e6e72]">
-                  点击后将草稿安装到剪映目录；请打开剪映 PC 版在草稿列表中查看，不要手动新建空白项目。
-                </p>
-                {capCutReplaceableMode ? (
-                  <div className="rounded border border-[#5c4a20] bg-[#2a2414] px-2 py-2 text-[10px] leading-relaxed text-[#d4a574]">
-                    <p className="mb-1 font-medium text-[#face15]">剪映内替换素材</p>
-                    <ol className="list-inside list-decimal space-y-0.5">
-                      {REPLACEABLE_TEMPLATE_STEPS.map((step) => (
-                        <li key={step}>{step}</li>
-                      ))}
-                    </ol>
-                  </div>
-                ) : null}
-              </div>
-            ) : null}
-            {exporting && exportProgress > 0 ? (
-              <div className="mb-3 h-1 overflow-hidden rounded bg-[#1a3a1a]">
-                <div
-                  className="h-full bg-[#4ade80] transition-all"
-                  style={{ width: `${exportProgress}%` }}
-                />
-              </div>
-            ) : null}
-            <PublishPanel exportUrl={exportUrl} />
-          </div>
-        </div>
-      ) : null}
-      {menuOpen ? (
-        <button
-          type="button"
-          className="absolute inset-0 z-10 bg-black/40"
-          aria-label="关闭菜单"
-          onClick={() => setMenuOpen(false)}
-        />
-      ) : null}
+      <PreviewExportDrawer
+        open={menuOpen}
+        onClose={() => setMenuOpen(false)}
+        exportUrl={exportUrl}
+        exportResolution={exportResolution}
+        onExportResolutionChange={onExportResolutionChange}
+        addSubtitles={addSubtitles}
+        onAddSubtitlesChange={onAddSubtitlesChange}
+        exportProgress={exportProgress}
+        exporting={exporting}
+        onExport={onExport}
+        onExportCapCut={onExportCapCut}
+        capCutDraftUrl={capCutDraftUrl}
+        capCutExporting={capCutExporting}
+        capCutExportProgress={capCutExportProgress}
+        capCutStatus={capCutStatus}
+        capCutReplaceableMode={capCutReplaceableMode}
+        onCapCutReplaceableModeChange={onCapCutReplaceableModeChange}
+        capCutMateStatus={capCutMateStatus}
+        onRefreshCapCutMate={onRefreshCapCutMate}
+        onOpenCapCutDraft={onOpenCapCutDraft}
+        canExport={canExport}
+      />
     </section>
   );
 }

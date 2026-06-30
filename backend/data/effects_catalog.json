@@ -1,0 +1,117 @@
+{
+  "version": 1,
+  "categories": [
+    {
+      "id": "subtitle_in",
+      "label": "字幕入场",
+      "description": "字幕出现时的动画",
+      "presets": [
+        { "id": "sub_in_fade", "name": "淡入", "icon": "fade", "apply": { "animation_in": "fade" } },
+        { "id": "sub_in_fade_up", "name": "上滑淡入", "icon": "up", "apply": { "animation_in": "fade_up" } },
+        { "id": "sub_in_fade_down", "name": "下滑淡入", "icon": "down", "apply": { "animation_in": "fade_down" } },
+        { "id": "sub_in_scale", "name": "缩放弹入", "icon": "scale", "apply": { "animation_in": "scale" } },
+        { "id": "sub_in_bounce", "name": "弹跳入场", "icon": "bounce", "apply": { "animation_in": "bounce" } },
+        { "id": "sub_in_typewriter", "name": "打字机", "icon": "type", "apply": { "animation_in": "typewriter" } },
+        { "id": "sub_in_blur", "name": "模糊渐清", "icon": "blur", "apply": { "animation_in": "blur_in" } }
+      ]
+    },
+    {
+      "id": "subtitle_out",
+      "label": "字幕出场",
+      "description": "字幕消失时的动画",
+      "presets": [
+        { "id": "sub_out_fade", "name": "淡出", "icon": "fade", "apply": { "animation_out": "fade" } },
+        { "id": "sub_out_fade_up", "name": "上滑淡出", "icon": "up", "apply": { "animation_out": "fade_up" } },
+        { "id": "sub_out_fade_down", "name": "下滑淡出", "icon": "down", "apply": { "animation_out": "fade_down" } },
+        { "id": "sub_out_scale", "name": "缩小淡出", "icon": "scale", "apply": { "animation_out": "scale_out" } },
+        { "id": "sub_out_blur", "name": "模糊消失", "icon": "blur", "apply": { "animation_out": "blur_out" } }
+      ]
+    },
+    {
+      "id": "subtitle_loop",
+      "label": "字幕循环",
+      "description": "字幕持续循环动画",
+      "presets": [
+        { "id": "sub_loop_none", "name": "无循环", "icon": "none", "apply": { "animation_loop": "none" } },
+        { "id": "sub_loop_pulse", "name": "呼吸闪烁", "icon": "pulse", "apply": { "animation_loop": "pulse" } },
+        { "id": "sub_loop_shake", "name": "轻微抖动", "icon": "shake", "apply": { "animation_loop": "shake" } },
+        { "id": "sub_loop_glow", "name": "描边发光", "icon": "glow", "apply": { "animation_loop": "glow" } },
+        { "id": "sub_loop_wave", "name": "波浪起伏", "icon": "wave", "apply": { "animation_loop": "wave" } }
+      ]
+    },
+    {
+      "id": "video_motion",
+      "label": "画面动效",
+      "description": "镜头缩放/关键帧动效",
+      "presets": [
+        {
+          "id": "vid_zoom_in_slow",
+          "name": "缓慢推近",
+          "icon": "zoom-in",
+          "apply": {
+            "keyframes": [
+              { "time": 0, "props": { "scale": 1, "opacity": 1 } },
+              { "time": 1, "props": { "scale": 1.12, "opacity": 1 } }
+            ]
+          }
+        },
+        {
+          "id": "vid_zoom_out_slow",
+          "name": "缓慢拉远",
+          "icon": "zoom-out",
+          "apply": {
+            "keyframes": [
+              { "time": 0, "props": { "scale": 1.12, "opacity": 1 } },
+              { "time": 1, "props": { "scale": 1, "opacity": 1 } }
+            ]
+          }
+        },
+        {
+          "id": "vid_fade_in",
+          "name": "画面淡入",
+          "icon": "fade",
+          "apply": {
+            "keyframes": [
+              { "time": 0, "props": { "scale": 1, "opacity": 0.2 } },
+              { "time": 0.35, "props": { "scale": 1, "opacity": 1 } }
+            ]
+          }
+        },
+        {
+          "id": "vid_fade_out",
+          "name": "画面淡出",
+          "icon": "fade",
+          "apply": {
+            "keyframes": [
+              { "time": 0.65, "props": { "scale": 1, "opacity": 1 } },
+              { "time": 1, "props": { "scale": 1, "opacity": 0.15 } }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "color_grade",
+      "label": "调色预设",
+      "description": "画面色彩风格",
+      "presets": [
+        { "id": "grade_cinematic", "name": "电影感", "apply": { "color_grade": { "contrast": 1.12, "saturation": 0.92, "brightness": -0.03 } } },
+        { "id": "grade_vivid", "name": "鲜艳旅行", "apply": { "color_grade": { "contrast": 1.05, "saturation": 1.25, "brightness": 0.02 } } },
+        { "id": "grade_warm", "name": "暖色治愈", "apply": { "color_grade": { "contrast": 1.02, "saturation": 1.08, "brightness": 0.04, "hue": 8 } } },
+        { "id": "grade_cool", "name": "冷色清新", "apply": { "color_grade": { "contrast": 1.04, "saturation": 0.95, "brightness": 0.01, "hue": -12 } } },
+        { "id": "grade_bw", "name": "黑白纪实", "apply": { "color_grade": { "contrast": 1.15, "saturation": 0, "brightness": 0 } } }
+      ]
+    },
+    {
+      "id": "transition",
+      "label": "转场",
+      "description": "槽位衔接转场（导出成片/剪映草稿）",
+      "presets": [
+        { "id": "trans_fade", "name": "叠化", "apply": { "transition_out": { "type": "fade", "duration": 0.35 } } },
+        { "id": "trans_dissolve", "name": "溶解", "apply": { "transition_out": { "type": "dissolve", "duration": 0.4 } } },
+        { "id": "trans_wipe", "name": "擦除", "apply": { "transition_out": { "type": "wipeleft", "duration": 0.35 } } },
+        { "id": "trans_slide", "name": "滑动", "apply": { "transition_out": { "type": "slideleft", "duration": 0.3 } } }
+      ]
+    }
+  ]
+}

@@ -6,6 +6,15 @@ import subprocess
 from typing import Any, Dict, List, Optional
 
 from utils.security import resolve_storage_path
+from services.media_probe import has_audio_stream
+from services.subtitle_render import (
+    ass_escape,
+    build_ass_from_timeline_slots,
+    format_ass_time,
+    make_template_subtitle_if_needed,
+    normalize_segments,
+    write_ass,
+)
 
 
 def run_cmd(cmd, cwd=None):
@@ -62,146 +71,137 @@ def to_bool(value) -> bool:
     return False
 
 
-def has_audio_stream(media_path: str) -> bool:
-    if not media_path or not os.path.exists(media_path):
-        return False
-
-    cmd = [
-        "ffprobe",
-        "-v", "error",
-        "-select_streams", "a:0",
-        "-show_entries", "stream=index",
-        "-of", "csv=p=0",
-        str(media_path)
-    ]
-
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="ignore"
-    )
-
-    return bool(result.stdout.strip())
-
-
 def extract_audio_for_subtitle(video_path: str, wav_path: str):
     """
     从模板视频中提取给 Whisper 用的音频。
     """
-    if not has_audio_stream(video_path):
-        raise RuntimeError(f"没有音频轨，无法识别字幕: {video_path}")
+    from services.media_probe import extract_whisper_wav
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", str(video_path),
-        "-vn",
-        "-ac", "1",
-        "-ar", "16000",
-        "-c:a", "pcm_s16le",
-        str(wav_path)
-    ]
-
-    run_cmd(cmd)
-
-    if not file_ok(wav_path):
-        raise RuntimeError(f"音频提取失败: {wav_path}")
+    extract_whisper_wav(video_path, wav_path)
 
 
-def normalize_segments(raw_segments: Any) -> List[Dict[str, Any]]:
-    if raw_segments is None:
-        return []
-
-    if isinstance(raw_segments, tuple) and len(raw_segments) >= 1:
-        raw_segments = raw_segments[0]
-
-    normalized = []
-
-    for seg in list(raw_segments):
-        if isinstance(seg, dict):
-            start = float(seg.get("start", 0))
-            end = float(seg.get("end", 0))
-            text = str(seg.get("text", "")).strip()
-        else:
-            start = float(getattr(seg, "start", 0))
-            end = float(getattr(seg, "end", 0))
-            text = str(getattr(seg, "text", "")).strip()
-
-        if not text:
-            continue
-
-        if end <= start:
-            continue
-
-        normalized.append({
-            "start": start,
-            "end": end,
-            "duration": end - start,
-            "text": text
-        })
-
-    return normalized
-
-
-def format_ass_time(seconds: float) -> str:
-    total_cs = int(round(seconds * 100))
-
-    h = total_cs // 360000
-    total_cs %= 360000
-
-    m = total_cs // 6000
-    total_cs %= 6000
-
-    s = total_cs // 100
-    cs = total_cs % 100
-
-    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
-
-
-def ass_escape(text: str) -> str:
-    return (
-        text.replace("\\", "\\\\")
-        .replace("{", "\\{")
-        .replace("}", "\\}")
-        .replace("\n", "\\N")
+def compile_slot_post_effects_vf(slot: dict[str, Any], width: int, height: int) -> str:
+    """已裁好尺寸的片段上叠加调色/蒙版/变速等（不含 scale/pad）。"""
+    from services.effects_engine import (
+        _interp_keyframes,
+        build_color_filter,
+        build_mask_filter,
+        build_speed_filter,
     )
 
+    parts: list[str] = []
+    speed = float(slot.get("speed") or 1.0)
+    optical = bool(slot.get("optical_flow") or slot.get("opticalFlow"))
+    sf = build_speed_filter(speed, use_optical_flow=optical)
+    if sf:
+        parts.append(sf)
 
-def write_ass(
-    segments: List[Dict[str, Any]],
+    keyframes = slot.get("keyframes") or []
+    if keyframes:
+        scale = _interp_keyframes(keyframes, "scale", 0.0, 1.0)
+        opacity = _interp_keyframes(keyframes, "opacity", 0.0, 1.0)
+        if abs(scale - 1.0) > 0.01:
+            parts.append(f"scale=iw*{scale}:ih*{scale}")
+        if opacity < 0.99:
+            parts.append(f"colorchannelmixer=aa={opacity}")
+
+    color_grade = slot.get("color_grade") or slot.get("colorGrade")
+    cf = build_color_filter(color_grade)
+    if cf:
+        parts.append(cf)
+
+    mask = slot.get("mask")
+    mf = build_mask_filter(mask, width, height)
+    if mf:
+        parts.append(mf)
+
+    return ",".join(parts)
+
+
+def slot_has_post_effects(slot: dict[str, Any]) -> bool:
+    if abs(float(slot.get("speed") or 1.0) - 1.0) > 0.01:
+        return True
+    if slot.get("keyframes"):
+        return True
+    color = slot.get("color_grade") or slot.get("colorGrade") or {}
+    if any(
+        abs(float(color.get(k, d)) - d) > 0.01
+        for k, d in (("brightness", 0), ("contrast", 1), ("saturation", 1), ("gamma", 1))
+    ):
+        return True
+    if abs(float(color.get("hue") or 0)) > 0.01:
+        return True
+    mask = slot.get("mask") or {}
+    if mask.get("enabled"):
+        return True
+    return False
+
+
+def legacy_subtitle_mask_vf(height: int) -> str:
+    """遮盖模板成片底部旧烧录字幕区域，避免与新字幕叠影。"""
+    y = int(height * 0.72)
+    bar_h = max(1, height - y)
+    return f"drawbox=x=0:y={y}:w=iw:h={bar_h}:color=black@0.78:t=fill"
+
+
+def burn_clip_with_vf_and_subtitles(
+    video_path: str,
     output_path: str,
-    width: int = 1080,
-    height: int = 1920
-):
-    header = f"""[Script Info]
-Title: AI Travel Cut Template Subtitle
-ScriptType: v4.00+
-Collisions: Normal
-PlayResX: {width}
-PlayResY: {height}
-Timer: 100.0000
+    *,
+    ass_path: Optional[str] = None,
+    extra_vf: str = "",
+    mask_legacy_subtitles: bool = False,
+    height: int = 1920,
+) -> str:
+    """对单段 MP4 重编码：可选遮罩旧字幕区 + 特效滤镜 + ASS 烧录。"""
+    video_path = os.path.abspath(video_path)
+    output_path = os.path.abspath(output_path)
+    workdir = os.path.dirname(video_path)
 
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Microsoft YaHei,54,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,3,0,2,60,60,120,1
+    ass_name: Optional[str] = None
+    if ass_path and os.path.isfile(ass_path):
+        ass_name = "clip_subtitle_burn.ass"
+        shutil.copy2(ass_path, os.path.join(workdir, ass_name))
 
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"""
+    vf_parts: list[str] = []
+    if mask_legacy_subtitles:
+        vf_parts.append(legacy_subtitle_mask_vf(height))
+    if extra_vf:
+        vf_parts.append(extra_vf)
+    if ass_name:
+        vf_parts.append(f"subtitles={ass_name}")
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(header)
+    if not vf_parts:
+        if video_path != output_path:
+            shutil.copy2(video_path, output_path)
+        return output_path
 
-        for seg in segments:
-            start = format_ass_time(float(seg["start"]))
-            end = format_ass_time(float(seg["end"]))
-            text = ass_escape(seg["text"])
+    vf = ",".join(vf_parts)
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-vf", vf,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        output_path,
+    ]
 
-            f.write(
-                f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}\n"
-            )
+    try:
+        run_cmd(cmd, cwd=workdir)
+    finally:
+        if ass_name:
+            try:
+                os.remove(os.path.join(workdir, ass_name))
+            except OSError:
+                pass
+
+    if not file_ok(output_path):
+        raise RuntimeError("片段字幕/特效烧录失败")
+    return output_path
 
 
 def cut_asset_clip(
@@ -351,6 +351,7 @@ def concat_clips(temp_clips: List[str], output_path: str):
     except Exception as e:
         print(f"快速合并失败，改用重新编码合并。原因: {e}")
 
+        has_any_audio = any(has_audio_stream(clip) for clip in temp_clips)
         cmd_reencode = [
             "ffmpeg", "-y",
             "-f", "concat",
@@ -360,13 +361,18 @@ def concat_clips(temp_clips: List[str], output_path: str):
             "-preset", "veryfast",
             "-crf", "23",
             "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-ar", "44100",
-            "-ac", "2",
             "-movflags", "+faststart",
             str(output_path)
         ]
+        if has_any_audio:
+            cmd_reencode.extend([
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-ar", "44100",
+                "-ac", "2",
+            ])
+        else:
+            cmd_reencode.append("-an")
 
         run_cmd(cmd_reencode)
 
@@ -540,120 +546,6 @@ def burn_subtitles(video_path: str, subtitle_path: str, output_path: str) -> str
     return output_path
 
 
-def build_ass_from_timeline_slots(
-    timeline: List[Dict[str, Any]],
-    temp_dir: str,
-    width: int,
-    height: int,
-) -> Optional[str]:
-    """从槽位 subtitle_text / subtitle_segments 生成 ASS（Phase A）。"""
-    segments: List[Dict[str, Any]] = []
-    cursor = 0.0
-
-    for slot in timeline:
-        dur = float(
-            slot.get("slot_duration")
-            or slot.get("clip_duration")
-            or slot.get("duration")
-            or 0
-        )
-        if dur <= 0:
-            continue
-
-        slot_abs_start = float(slot.get("slot_start") if slot.get("slot_start") is not None else cursor)
-        sub_segs = slot.get("subtitle_segments") or []
-
-        if sub_segs:
-            for seg in sub_segs:
-                text = str(seg.get("text", "")).strip()
-                if not text:
-                    continue
-                seg_start = float(seg.get("start", slot_abs_start))
-                seg_end = float(seg.get("end", seg_start + 0.5))
-                segments.append({"start": seg_start, "end": seg_end, "text": text})
-        else:
-            text = str(slot.get("subtitle_text") or "").strip()
-            if text:
-                segments.append({
-                    "start": cursor + 0.05,
-                    "end": cursor + dur - 0.05,
-                    "text": text,
-                })
-
-        cursor += dur
-
-    if not segments:
-        return None
-
-    out_path = os.path.join(temp_dir, "slot_timeline_subtitle.ass")
-    write_ass(segments, out_path, width=width, height=height)
-    return out_path
-
-
-def make_template_subtitle_if_needed(
-    template_video_path: Optional[str],
-    template_subtitle_srt_path: Optional[str],
-    template_subtitle_ass_path: Optional[str],
-    template_segments_json,
-    temp_dir: str,
-    width: int,
-    height: int
-) -> Optional[str]:
-    """
-    字幕来源优先级：
-    1. 模板 ASS 字幕
-    2. 模板 SRT 字幕
-    3. 模板 segments_json
-    4. 从模板视频实时识别
-    """
-    if template_subtitle_ass_path and os.path.exists(template_subtitle_ass_path):
-        return template_subtitle_ass_path
-
-    if template_subtitle_srt_path and os.path.exists(template_subtitle_srt_path):
-        return template_subtitle_srt_path
-
-    if isinstance(template_segments_json, str):
-        try:
-            template_segments_json = json.loads(template_segments_json)
-        except Exception:
-            template_segments_json = []
-
-    if template_segments_json:
-        fallback_ass_path = os.path.join(temp_dir, "segments_template_subtitle.ass")
-        write_ass(template_segments_json, fallback_ass_path, width=width, height=height)
-        return fallback_ass_path
-
-    if not template_video_path or not os.path.exists(template_video_path):
-        return None
-
-    if not has_audio_stream(template_video_path):
-        return None
-
-    print("模板没有预生成字幕文件，开始从模板视频实时识别字幕...")
-
-    try:
-        from services.subtitle_gen import transcribe
-
-        whisper_audio_path = os.path.join(temp_dir, "fallback_template_subtitle_audio.wav")
-        fallback_ass_path = os.path.join(temp_dir, "fallback_template_subtitle.ass")
-
-        extract_audio_for_subtitle(template_video_path, whisper_audio_path)
-
-        raw_segments = transcribe(whisper_audio_path)
-        segments = normalize_segments(raw_segments)
-
-        if not segments:
-            return None
-
-        write_ass(segments, fallback_ass_path, width=width, height=height)
-
-        return fallback_ass_path
-
-    except Exception as e:
-        print(f"实时识别模板字幕失败: {e}")
-        return None
-
-
 def export_video(
     timeline: list,
     output_path: str,
@@ -670,6 +562,7 @@ def export_video(
     use_asset_audio: bool = False,
     asset_audio_volume: float = 0.3,
     template_audio_volume: float = 1.0,
+    tts_segments: list | None = None,
 ) -> str:
     """
     正确产品逻辑：
@@ -803,10 +696,32 @@ def export_video(
 
         print("正在添加模板音频...")
 
-        template_audio_source = select_template_audio_source(
-            template_audio_path=template_audio_path,
-            template_video_path=template_video_path
-        )
+        template_audio_source = None
+        tts_audio_path = os.path.join(temp_dir, "tts_concat.m4a")
+        if tts_segments:
+            from services.tts.tts_pipeline import concat_tts_for_timeline
+
+            concat_path = concat_tts_for_timeline(timeline, tts_segments, tts_audio_path.replace(".m4a", ".wav"))
+            if concat_path and os.path.isfile(concat_path):
+                if concat_path.lower().endswith(".wav"):
+                    ensure_ffmpeg()
+                    import subprocess
+
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-i", concat_path, "-c:a", "aac", "-b:a", "192k", tts_audio_path],
+                        check=True,
+                        capture_output=True,
+                    )
+                    if file_ok(tts_audio_path):
+                        template_audio_source = tts_audio_path
+                else:
+                    template_audio_source = concat_path
+
+        if not template_audio_source:
+            template_audio_source = select_template_audio_source(
+                template_audio_path=template_audio_path,
+                template_video_path=template_video_path,
+            )
 
         if not template_audio_source:
             if any_asset_audio_enabled and has_audio_stream(merged):

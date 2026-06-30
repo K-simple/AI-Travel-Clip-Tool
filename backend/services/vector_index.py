@@ -37,14 +37,8 @@ def _save(data: Dict[str, Any]) -> None:
 
 
 def upsert_segment_embedding(seg_key: str, embedding: List[float], meta: Optional[Dict[str, Any]] = None) -> None:
-    try:
-        from services.vector_store import upsert
-
-        upsert(seg_key, embedding, meta)
-    except Exception:
-        pass
     data = _load()
-    data["segments"][seg_key] = {
+    data.setdefault("segments", {})[seg_key] = {
         "embedding": embedding,
         "meta": meta or {},
     }

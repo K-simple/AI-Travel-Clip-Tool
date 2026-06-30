@@ -1,5 +1,7 @@
 /** 预览区画幅与画质（仅影响播放，不影响导出） */
 
+import { defaultPreviewQuality } from '@/lib/deviceProfile';
+
 export type AspectRatioId =
   | 'auto'
   | '9:16'
@@ -151,14 +153,14 @@ export function isPreviewQualityId(value: string): value is PreviewQualityId {
 }
 
 export function loadStoredPreviewQuality(): PreviewQualityId {
-  if (typeof window === 'undefined') return 'smooth';
+  if (typeof window === 'undefined') return defaultPreviewQuality();
   try {
     const stored = window.localStorage.getItem(PREVIEW_QUALITY_STORAGE_KEY);
     if (stored && isPreviewQualityId(stored)) return stored;
   } catch {
     /* ignore */
   }
-  return 'smooth';
+  return defaultPreviewQuality();
 }
 
 export function storePreviewQuality(quality: PreviewQualityId): void {

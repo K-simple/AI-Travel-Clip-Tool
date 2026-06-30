@@ -2,6 +2,8 @@
 
 import { useEffect, useState } from 'react';
 import { toMediaUrl } from '@/lib/api';
+import type { TimelineThumbnail } from '@/lib/timelineThumbnails';
+import { TimelineFrameFilmstrip } from '@/components/timeline/TimelineFrameFilmstrip';
 
 function waitSeek(video: HTMLVideoElement, time: number): Promise<void> {
   return new Promise((resolve) => {
@@ -32,6 +34,52 @@ function loadImage(src: string): Promise<HTMLImageElement> {
   });
 }
 
+type PrecomputedFilmstripProps = {
+  url: string;
+  width: number;
+  clipStart?: number;
+  duration?: number;
+  sourceDuration?: number;
+};
+
+/** 服务端 ffmpeg 预生成的横向胶片条，铺满槽位宽度 */
+export function PrecomputedFilmstrip({
+  url,
+  width,
+  clipStart = 0,
+  duration,
+  sourceDuration,
+}: PrecomputedFilmstripProps) {
+  const src = toMediaUrl(url);
+  const total = sourceDuration && sourceDuration > 0 ? sourceDuration : duration;
+  const canCrop =
+    total != null && total > 0 && duration != null && duration > 0 && clipStart > 0;
+  if (canCrop && total) {
+    const startPct = (clipStart / total) * 100;
+    const spanPct = (duration! / total) * 100;
+    return (
+      <div
+        className="h-full w-full bg-[#0a1a16] bg-no-repeat"
+        style={{
+          backgroundImage: `url(${src})`,
+          backgroundSize: `${(100 / spanPct) * 100}% 100%`,
+          backgroundPosition: `${startPct}% center`,
+        }}
+      />
+    );
+  }
+
+  return (
+    <img
+      src={src}
+      alt=""
+      draggable={false}
+      className="h-full w-full select-none object-fill"
+      style={{ minWidth: width }}
+    />
+  );
+}
+
 type ClipFilmstripProps = {
   videoSrc: string;
   clipStart: number;
@@ -39,7 +87,18 @@ type ClipFilmstripProps = {
   width: number;
   pxPerSec?: number;
   fallbackThumb?: string;
+  filmstripUrl?: string;
+  filmstripFrames?: number;
+  filmstripTileWidth?: number;
+  timelineThumbnails?: TimelineThumbnail[];
+  timelineThumbnailsLoading?: boolean;
+  sampleIntervalSec?: number;
+  slotSourceStart?: number;
+  slotSourceEnd?: number;
 };
+
+const MAX_CAPTURE_FRAMES = 400;
+const MIN_FRAME_W = 10;
 
 /** 剪映风格：整段胶片条无缝铺满片段宽度 */
 export function ClipFilmstrip({
@@ -49,12 +108,60 @@ export function ClipFilmstrip({
   width,
   pxPerSec = 48,
   fallbackThumb,
+  filmstripUrl,
+  filmstripFrames,
+  filmstripTileWidth,
+  timelineThumbnails,
+  timelineThumbnailsLoading = false,
+  sampleIntervalSec = 0.5,
+  slotSourceStart,
+  slotSourceEnd,
 }: ClipFilmstripProps) {
-  const frameW = Math.max(16, Math.min(52, Math.round(pxPerSec * 0.55)));
-  const frameCount = Math.max(2, Math.ceil(width / frameW));
-  const captureKey = `${videoSrc}|${clipStart.toFixed(2)}|${duration.toFixed(2)}|${frameCount}|${frameW}`;
+  const sourceStart = slotSourceStart ?? clipStart;
+  const sourceEnd = slotSourceEnd ?? clipStart + duration;
+
+  const useFrameFilmstrip =
+    timelineThumbnails?.length ||
+    timelineThumbnailsLoading ||
+    (!videoSrc && !filmstripUrl && !!fallbackThumb);
+
+  if (useFrameFilmstrip) {
+    return (
+      <TimelineFrameFilmstrip
+        thumbnails={timelineThumbnails ?? []}
+        slotStart={sourceStart}
+        slotEnd={sourceEnd}
+        width={width}
+        pxPerSec={pxPerSec}
+        sampleIntervalSec={sampleIntervalSec}
+        fallbackThumb={fallbackThumb}
+        loading={timelineThumbnailsLoading}
+      />
+    );
+  }
+
+  if (
+    filmstripUrl &&
+    filmstripFrames &&
+    filmstripFrames > 1 &&
+    filmstripTileWidth
+  ) {
+    return (
+      <PrecomputedFilmstrip
+        url={filmstripUrl}
+        width={width}
+        clipStart={clipStart}
+        duration={duration}
+      />
+    );
+  }
+
+  const frameW = Math.max(MIN_FRAME_W, Math.min(36, Math.round(pxPerSec * 0.38)));
+  const frameCount = Math.min(MAX_CAPTURE_FRAMES, Math.max(4, Math.ceil(width / frameW)));
+  const captureKey = `${videoSrc}|${clipStart.toFixed(2)}|${duration.toFixed(2)}|${frameCount}|${frameW}|${pxPerSec.toFixed(1)}`;
   const fallbackUrl = fallbackThumb ? toMediaUrl(fallbackThumb) : '';
   const [stripUrl, setStripUrl] = useState('');
+  const [stripPixelWidth, setStripPixelWidth] = useState(0);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -63,11 +170,13 @@ export function ClipFilmstrip({
     let cancelled = false;
     setLoading(true);
     setStripUrl('');
+    setStripPixelWidth(0);
 
     const video = document.createElement('video');
     video.muted = true;
     video.playsInline = true;
     video.preload = 'auto';
+    video.crossOrigin = 'anonymous';
     video.src = toMediaUrl(videoSrc);
 
     const capture = async () => {
@@ -118,8 +227,9 @@ export function ClipFilmstrip({
 
       if (cancelled) return;
 
+      const totalW = frameW * frameCount;
       const stripCanvas = document.createElement('canvas');
-      stripCanvas.width = frameW * frameCount;
+      stripCanvas.width = totalW;
       stripCanvas.height = h;
       const stripCtx = stripCanvas.getContext('2d');
       if (!stripCtx) return;
@@ -131,6 +241,7 @@ export function ClipFilmstrip({
       }
 
       if (!cancelled) {
+        setStripPixelWidth(totalW);
         setStripUrl(stripCanvas.toDataURL('image/jpeg', 0.72));
         setLoading(false);
       }
@@ -149,13 +260,16 @@ export function ClipFilmstrip({
       video.removeAttribute('src');
       video.load();
     };
-  }, [captureKey, clipStart, duration, fallbackUrl, frameCount, frameW, videoSrc]);
+  }, [captureKey, clipStart, duration, fallbackUrl, frameCount, frameW, videoSrc, pxPerSec]);
 
   if (stripUrl) {
     return (
-      <div
-        className="h-full w-full bg-[#0a1a16] bg-cover bg-left bg-no-repeat"
-        style={{ backgroundImage: `url(${stripUrl})` }}
+      <img
+        src={stripUrl}
+        alt=""
+        draggable={false}
+        className="h-full w-full select-none object-cover object-left"
+        style={stripPixelWidth > 0 ? { minWidth: stripPixelWidth } : undefined}
       />
     );
   }
@@ -174,7 +288,7 @@ export function ClipFilmstrip({
       {loading ? (
         <div className="h-full w-full animate-pulse bg-gradient-to-r from-[#0f1f1a] via-[#1a2e28] to-[#0f1f1a]" />
       ) : (
-        <span className="text-[9px] text-white/35">拖入素材</span>
+        <span className="text-[9px] text-white/35">加载画面…</span>
       )}
     </div>
   );

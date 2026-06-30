@@ -2,7 +2,7 @@ import json
 import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Callable
+from typing import Any, Callable
 
 from scenedetect import ContentDetector, detect
 
@@ -52,6 +52,67 @@ def extract_frame(video_path: str, time_sec: float, output_path: str) -> str:
     if result.returncode != 0:
         print(f"截帧失败: {video_path} @ {time_sec}s\n{result.stderr}")
     return output_path
+
+
+def build_template_filmstrip(
+    video_path: str,
+    output_path: str,
+    duration: float,
+    *,
+    tile_width: int = 72,
+    tile_height: int = 72,
+    max_frames: int = 360,
+    min_fps: float = 4.0,
+    max_fps: float = 12.0,
+) -> dict[str, Any] | None:
+    """
+    生成横向胶片条（时间轴导轨逐帧预览）。
+    按视频时长采样多帧并 tile 成一张图，供前端铺满槽位宽度。
+    """
+    if duration <= 0 or not video_path or not os.path.isfile(video_path):
+        return None
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    target_frames = min(max_frames, max(12, int(round(duration * min_fps))))
+    fps = min(max_fps, max(min_fps, target_frames / duration))
+    frame_count = max(2, min(max_frames, int(round(duration * fps))))
+
+    vf = (
+        f"fps={fps:.4f},"
+        f"scale={tile_width}:{tile_height}:force_original_aspect_ratio=increase,"
+        f"crop={tile_width}:{tile_height},"
+        f"tile={frame_count}x1"
+    )
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        video_path,
+        "-vf",
+        vf,
+        "-frames:v",
+        "1",
+        "-q:v",
+        "5",
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not os.path.isfile(output_path):
+        print(f"胶片条生成失败: {video_path}\n{result.stderr[-400:]}")
+        return None
+
+    rel = output_path.replace("\\", "/")
+    print(f"模板胶片条: {rel} ({frame_count} 帧 @ {fps:.2f}fps)")
+    return {
+        "path": rel,
+        "filmstrip": rel,
+        "frame_count": frame_count,
+        "filmstrip_frames": frame_count,
+        "tile_width": tile_width,
+        "filmstrip_tile_width": tile_width,
+        "tile_height": tile_height,
+        "fps": round(fps, 3),
+    }
 
 
 def _limit_segments(segments: list, max_count: int, *, merge: bool = True) -> list:
@@ -221,6 +282,121 @@ def detect_scenes(
     return raw
 
 
+def build_base_template_slot(
+    file_path: str,
+    thumb_dir: str,
+    duration: float,
+    *,
+    extract_thumb: bool = True,
+) -> list[dict]:
+    """base 模式：整段原视频作为一个 base slot，等待用户 AI 一键分割。"""
+    if duration <= 0:
+        return []
+
+    dur = round(float(duration), 3)
+    slot: dict = {
+        "id": "slot_base_001",
+        "slot_id": 1,
+        "segment_id": "seg_base_1",
+        "type": "video",
+        "start": 0.0,
+        "end": dur,
+        "duration": dur,
+        "clip_start": 0.0,
+        "clip_end": dur,
+        "template_source_start": 0.0,
+        "thumbnail": "",
+        "tags": [],
+        "scene_tags": [],
+        "shot_type": "wide",
+        "has_person": False,
+        "quality_score": 0.5,
+        "mood": "",
+        "source": "base",
+        "cut_reason": "full_video",
+        "isBaseSlot": True,
+        "subtitle_text": "",
+    }
+    slots = [slot]
+    if extract_thumb and file_path and thumb_dir:
+        slots = _attach_thumbnails(file_path, thumb_dir, slots)
+    print(f"模板 base 槽: {file_path} -> 1 个全片槽 ({dur}s)")
+    return slots
+
+
+def build_single_template_slot(
+    file_path: str,
+    thumb_dir: str,
+    duration: float,
+    *,
+    extract_thumb: bool = True,
+) -> list[dict]:
+    """兼容旧名：等同 build_base_template_slot。"""
+    return build_base_template_slot(file_path, thumb_dir, duration, extract_thumb=extract_thumb)
+
+
+def build_visual_cut_suggestions(
+    file_path: str,
+    thumb_dir: str,
+    duration: float,
+) -> list[dict[str, Any]]:
+    """PySceneDetect 仅生成建议切点，不写入 slots。"""
+    if duration <= 0:
+        return []
+    try:
+        from services.template_scene_tuning import resolve_tuning_for_template
+
+        tuning = resolve_tuning_for_template(file_path)
+        shots = detect_scenes(
+            file_path,
+            thumb_dir,
+            max_segments=tuning.max_segments,
+            threshold=tuning.threshold,
+            min_duration=tuning.min_shot_duration,
+            merge_when_capped=False,
+            extract_thumbs=False,
+            allow_interval_fallback=False,
+        )
+        suggestions = []
+        for i, shot in enumerate(shots or []):
+            if not isinstance(shot, dict):
+                continue
+            suggestions.append(
+                {
+                    "index": i + 1,
+                    "start": float(shot.get("start", 0)),
+                    "end": float(shot.get("end", 0)),
+                    "duration": float(shot.get("duration") or 0),
+                    "shot_type": shot.get("shot_type"),
+                }
+            )
+        print(f"visualCutSuggestions: {len(suggestions)} 个画面切点（未写入 slots）")
+        return suggestions
+    except Exception as exc:
+        print(f"visualCutSuggestions 跳过: {exc}")
+        return []
+
+
+def build_template_intake_slots(
+    file_path: str,
+    thumb_dir: str,
+    duration: float,
+    **kwargs,
+) -> list:
+    """模板 intake 槽位：base 模式仅全片槽；auto_visual 走 PySceneDetect。"""
+    from services.processing_config import is_base_slot_creation_mode
+
+    if is_base_slot_creation_mode():
+        extract_thumbs = kwargs.get("extract_thumbs", True)
+        return build_base_template_slot(
+            file_path,
+            thumb_dir,
+            duration,
+            extract_thumb=bool(extract_thumbs),
+        )
+    return build_template_shot_slots(file_path, thumb_dir, duration, **kwargs)
+
+
 def build_interval_segments(
     total_duration: float,
     interval: float = 4.0,
@@ -280,7 +456,18 @@ def build_template_shot_slots(
 ) -> list:
     """
     旅游混剪模板槽位：场景检测（一镜一槽）+ 可选自动校准 + AI 修正。
+    base 模式禁止调用（应走 build_base_template_slot）。
     """
+    from services.processing_config import is_base_slot_creation_mode
+
+    if is_base_slot_creation_mode():
+        return build_base_template_slot(
+            file_path,
+            thumb_dir,
+            duration,
+            extract_thumb=extract_thumbs,
+        )
+
     from services.template_scene_tuning import (
         calibrate_template_scenes,
         resolve_tuning_for_template,

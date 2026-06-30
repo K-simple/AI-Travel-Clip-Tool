@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from models.database import Asset, Project, Template, get_db
 from services.match_strategy import MatchStrategy
 from services.matcher import MatchWeights, match_slots
+from services.smart_matcher import enrich_timeline_for_matching, slots_missing_understanding
 from utils.edl_timeline import slots_timeline_to_edl
 
 router = APIRouter()
@@ -86,13 +87,6 @@ class MatchRunRequest(BaseModel):
     strategy: Optional[Dict[str, Any]] = None
 
 
-class ReplaceSlotRequest(BaseModel):
-    project_id: str
-    slot_id: str
-    asset_id: str
-    segment_start: float = 0.0
-
-
 @router.post("/run")
 def run_match(req: MatchRunRequest, db: Session = Depends(get_db)):
     project = db.query(Project).filter(Project.id == req.project_id).first()
@@ -106,9 +100,37 @@ def run_match(req: MatchRunRequest, db: Session = Depends(get_db)):
     if template.id != project.template_id:
         raise HTTPException(status_code=400, detail="project_id 与 template_id 不匹配")
 
+    from services.slot_helpers import has_ai_caption_split_slots, has_mixed_slot_sources, is_base_only_timeline
+
+    template_slots = list(template.slots or [])
+    if is_base_only_timeline(template_slots):
+        raise HTTPException(status_code=400, detail="请先点击 AI 一键分割画面，再进行素材匹配。")
+
+    if has_mixed_slot_sources(template_slots):
+        raise HTTPException(
+            status_code=400,
+            detail="画面槽数据不一致（旧镜头切分与字幕分割混用），请重新执行 AI 一键分割画面。",
+        )
+
+    if has_ai_caption_split_slots(template_slots) and not all(
+        str(s.get("source") or "") == "ai_caption_split" for s in template_slots if isinstance(s, dict)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="画面槽含非字幕分割槽位，请重新执行 AI 一键分割画面。",
+        )
+
     old_timeline = list(project.timeline or [])
     if not old_timeline:
         raise HTTPException(status_code=400, detail="项目时间线为空，请先从模板创建项目")
+
+    old_timeline = enrich_timeline_for_matching(old_timeline, template_slots)
+    understanding_warning = None
+    if slots_missing_understanding(old_timeline, ratio=0.5):
+        understanding_warning = (
+            "部分模板槽位尚未完成 AI 画面理解，匹配准确度可能下降；"
+            "建议等待模板分析完成或重新上传模板"
+        )
 
     assets = (
         db.query(Asset).all()
@@ -133,7 +155,10 @@ def run_match(req: MatchRunRequest, db: Session = Depends(get_db)):
     if not all_segments:
         raise HTTPException(status_code=400, detail="素材片段为空，请先上传素材并生成片段")
 
-    all_segments = expand_segments_for_matching(assets, all_segments)
+    from services.processing_config import is_one_slot_one_material
+
+    if not is_one_slot_one_material():
+        all_segments = expand_segments_for_matching(assets, all_segments)
 
     weights = MatchWeights.from_dict(req.weights.model_dump() if req.weights else None)
     strategy = MatchStrategy.from_dict(req.strategy)
@@ -162,6 +187,14 @@ def run_match(req: MatchRunRequest, db: Session = Depends(get_db)):
         if match.get("asset_id"):
             matched_count += 1
             slot_duration = old_slot.get("slot_duration", old_slot.get("duration", 0))
+            template_clip_start = old_slot.get("template_clip_start")
+            if template_clip_start is None and not old_slot.get("asset_id"):
+                template_clip_start = float(old_slot.get("clip_start", 0))
+            linked_caption = (
+                old_slot.get("linkedCaptionClipId")
+                or old_slot.get("linked_subtitle_clip_id")
+                or old_slot.get("linkedSubtitleClipId")
+            )
             new_slot = {
                 **old_slot,
                 "asset_id": match["asset_id"],
@@ -175,7 +208,14 @@ def run_match(req: MatchRunRequest, db: Session = Depends(get_db)):
                 "clip_duration": slot_duration,
                 "match_score": match.get("match_score", 0),
                 "match_reason": match.get("match_reason", "自动匹配"),
+                "use_original_audio": False,
+                "linked_slot_id": old_slot.get("slot_id"),
+                "linkedSlotId": old_slot.get("slot_id"),
+                "linked_caption_clip_id": linked_caption,
+                "linkedCaptionClipId": linked_caption,
             }
+            if template_clip_start is not None:
+                new_slot["template_clip_start"] = template_clip_start
         else:
             new_slot = {
                 **old_slot,
@@ -201,6 +241,8 @@ def run_match(req: MatchRunRequest, db: Session = Depends(get_db)):
 
     unmatched_count = len([slot for slot in new_timeline if not slot.get("asset_id")])
 
+    from services.slot_helpers import build_one_caption_one_shot_debug
+
     return {
         "success": True,
         "project_id": project.id,
@@ -208,61 +250,12 @@ def run_match(req: MatchRunRequest, db: Session = Depends(get_db)):
         "matched_count": matched_count,
         "unmatched_count": unmatched_count,
         "warnings": warnings,
+        "understanding_warning": understanding_warning,
         "edl": project.edl_json,
         "strategy": strategy.to_dict(),
+        "oneCaptionOneShotDebug": build_one_caption_one_shot_debug(
+            caption_clips=getattr(template, "subtitle_clips_json", []) or [],
+            slots=template_slots,
+            timeline=new_timeline,
+        ),
     }
-
-
-@router.put("/replace")
-def replace_slot(req: ReplaceSlotRequest, db: Session = Depends(get_db)):
-    project = db.query(Project).filter(Project.id == req.project_id).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="项目不存在")
-
-    asset = db.query(Asset).filter(Asset.id == req.asset_id).first()
-    if not asset:
-        raise HTTPException(status_code=404, detail="素材不存在")
-
-    timeline = list(project.timeline or [])
-    target_slot = None
-    for slot in timeline:
-        if str(slot.get("slot_id")) == str(req.slot_id):
-            target_slot = slot
-            break
-
-    if not target_slot:
-        raise HTTPException(status_code=404, detail="槽位不存在")
-
-    slot_duration = float(
-        target_slot.get("slot_duration", target_slot.get("duration", 0)) or 0
-    )
-    seg = None
-    if asset.segments:
-        for item in asset.segments:
-            if abs(float(item.get("start", 0)) - req.segment_start) < 0.05:
-                seg = item
-                break
-        if not seg:
-            seg = asset.segments[0]
-
-    seg_video = (seg or {}).get("segment_file_path") or ""
-    use_seg_file = bool(str(seg_video).strip())
-
-    target_slot["asset_id"] = req.asset_id
-    target_slot["segment_id"] = (seg or {}).get("segment_id")
-    target_slot["segment_file_path"] = seg_video
-    target_slot["asset_filename"] = asset.filename
-    target_slot["asset_file_path"] = seg_video if use_seg_file else asset.file_path
-    target_slot["asset_thumbnail"] = (seg or {}).get("thumbnail") or asset.thumbnail_path
-    target_slot["clip_start"] = 0.0 if use_seg_file else req.segment_start
-    if seg:
-        target_slot["clip_end"] = float(seg.get("end", 0))
-    target_slot["clip_duration"] = slot_duration
-    target_slot["match_reason"] = "手动替换"
-
-    project.timeline = timeline
-    if hasattr(project, "updated_at"):
-        project.updated_at = time.time()
-    db.commit()
-
-    return {"success": True, "timeline": timeline}

@@ -21,10 +21,26 @@ from services.capcut_mate_client import (
     require_capcut_mate,
     save_draft,
 )
-from services.slot_subtitle import get_whisper_source_path
-from services.subtitle_style_analyzer import style_to_capcut_params, style_signature
+from services.effects_catalog import merge_auto_effects_into_slot
+from services.subtitle_style_analyzer import (
+    ensure_timeline_styles_from_template_video,
+    resolve_subtitle_style_for_export,
+    style_signature,
+    style_to_capcut_params,
+    style_to_capcut_caption_item,
+)
+from services.transitions import resolve_transition
 from services.segment_extractor import extract_segment_audio, extract_segment_video
-from services.video_exporter import cut_asset_clip, ensure_ffmpeg, file_ok
+from services.slot_subtitle import get_whisper_source_path
+from services.subtitle_render import build_ass_from_timeline_slots, write_ass_styled_for_clip
+from services.video_exporter import (
+    burn_clip_with_vf_and_subtitles,
+    compile_slot_post_effects_vf,
+    cut_asset_clip,
+    ensure_ffmpeg,
+    file_ok,
+    slot_has_post_effects,
+)
 from utils.export_controls import resolve_export_mix
 from utils.public_media import (
     build_capcut_clip_url,
@@ -125,6 +141,8 @@ def _slot_duration(slot: dict[str, Any]) -> float:
 
 
 def _template_clip_start(slot: dict[str, Any]) -> float:
+    if slot.get("template_clip_start") is not None:
+        return float(slot.get("template_clip_start"))
     if slot.get("clip_start") is not None:
         return float(slot.get("clip_start"))
     return float(slot.get("slot_start") or slot.get("start") or 0)
@@ -312,6 +330,65 @@ def _parse_srt_file(path: str) -> list[dict[str, Any]]:
     return segments
 
 
+def _load_template_tts_segments(template) -> list[dict[str, Any]]:
+    raw = getattr(template, "tts_segments_json", None) or []
+    return [dict(s) for s in raw if isinstance(s, dict)]
+
+
+def _resolve_slot_tts_segment(slot: dict[str, Any], tts_segments: list[dict[str, Any]]) -> dict[str, Any] | None:
+    from services.tts.tts_pipeline import index_tts_by_caption_id
+
+    if not tts_segments:
+        return None
+    tts_id = str(slot.get("linked_tts_segment_id") or slot.get("linkedTtsSegmentId") or "")
+    if tts_id:
+        for seg in tts_segments:
+            if str(seg.get("id") or "") == tts_id:
+                return seg
+    clip_id = str(
+        slot.get("linked_subtitle_clip_id")
+        or slot.get("linkedSubtitleClipId")
+        or slot.get("linkedCaptionClipId")
+        or ""
+    )
+    if clip_id:
+        return index_tts_by_caption_id(tts_segments).get(clip_id)
+    return None
+
+
+def _prepare_tts_audio_for_slot(tts_seg: dict[str, Any], output_path: str) -> bool:
+    from utils.security import resolve_storage_path
+
+    ap = str(tts_seg.get("audioPath") or "").strip()
+    if not ap:
+        return False
+    src = resolve_storage_path(ap) or ap
+    if not os.path.isfile(src):
+        return False
+    if src.lower().endswith(".wav"):
+        ensure_ffmpeg()
+        import subprocess
+
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                src,
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                output_path,
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return file_ok(output_path)
+    shutil.copy2(src, output_path)
+    return file_ok(output_path)
+
+
 def _load_template_subtitle_segments(template) -> list[dict[str, Any]]:
     segments = getattr(template, "segments_json", None) or []
     if segments:
@@ -366,6 +443,25 @@ def _attach_template_subtitles_to_timeline(
     return result
 
 
+def _best_template_segment_for_range(
+    segments: list[dict[str, Any]],
+    start: float,
+    end: float,
+) -> dict[str, Any] | None:
+    best: dict[str, Any] | None = None
+    best_overlap = 0.0
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        seg_start = float(seg.get("start", 0))
+        seg_end = float(seg.get("end", seg_start))
+        overlap = max(0.0, min(end, seg_end) - max(start, seg_start))
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best = seg
+    return best
+
+
 def _collect_captions_for_slot(
     slot: dict[str, Any],
     *,
@@ -376,6 +472,7 @@ def _collect_captions_for_slot(
     captions: list[dict[str, Any]] = []
     clip_duration_us = _us(clip_duration_sec)
     sub_segs = slot.get("subtitle_segments") or []
+    slot_style = resolve_subtitle_style_for_export(slot)
 
     if sub_segs:
         for seg in sub_segs:
@@ -389,12 +486,17 @@ def _collect_captions_for_slot(
                 clip_duration_sec,
                 max(rel_start + 0.08, seg_end - source_range_start),
             )
+            seg_style = seg.get("style") if isinstance(seg.get("style"), dict) else {}
+            merged_style = resolve_subtitle_style_for_export(
+                slot,
+                template_segment={"style": seg_style} if seg_style else None,
+            )
             captions.append(
                 {
                     "start": timeline_start_us + _us(rel_start),
                     "end": timeline_start_us + _us(rel_end),
                     "text": text,
-                    "style": seg.get("style") or {},
+                    "style": merged_style,
                 }
             )
         return captions
@@ -406,7 +508,7 @@ def _collect_captions_for_slot(
                 "start": timeline_start_us + _us(0.05),
                 "end": timeline_start_us + max(_us(0.2), clip_duration_us - _us(0.05)),
                 "text": subtitle_text,
-                "style": slot.get("subtitle_style") or {},
+                "style": slot_style,
             }
         )
     return captions
@@ -416,6 +518,8 @@ def _add_styled_captions_to_draft(
     draft_url: str,
     captions: list[dict[str, Any]],
     warnings: list[str],
+    *,
+    frame_height: int = 1920,
 ) -> str:
     if not captions:
         return draft_url
@@ -428,11 +532,11 @@ def _add_styled_captions_to_draft(
 
     for items in groups.values():
         style = items[0][1] if items else {}
-        params = style_to_capcut_params(style)
-        payload = [
-            {"start": c["start"], "end": c["end"], "text": c["text"]}
-            for c, _ in items
-        ]
+        params = style_to_capcut_params(style, frame_height=frame_height)
+        payload: list[dict[str, Any]] = []
+        for cap, cap_style in items:
+            clip_dur = max(1, int(cap["end"]) - int(cap["start"]))
+            payload.append(style_to_capcut_caption_item(cap, cap_style, clip_duration_us=clip_dur))
         try:
             cap_resp = add_captions(draft_url, payload, **params)
             draft_url = cap_resp.get("draft_url") or draft_url
@@ -506,6 +610,199 @@ def _enrich_timeline_subtitles(timeline: list, template) -> list[dict[str, Any]]
 
     segments = _load_template_subtitle_segments(template)
     return _attach_template_subtitles_to_timeline(timeline, segments)
+
+
+def _enrich_slots_from_subtitle_clips(
+    timeline: list,
+    template,
+) -> list[dict[str, Any]]:
+    """用 validatedCaptionClips 补全槽位字幕（优先 linkedCaptionClipId），并合并动画样式。"""
+    clips = getattr(template, "subtitle_clips_json", None) or []
+    template_segments = _load_template_subtitle_segments(template)
+    if not clips:
+        return [dict(s) if isinstance(s, dict) else s for s in timeline]
+
+    clip_by_id: dict[str, dict[str, Any]] = {}
+    for cap in clips:
+        if isinstance(cap, dict) and cap.get("id"):
+            clip_by_id[str(cap["id"])] = cap
+
+    result: list[dict[str, Any]] = []
+    for index, slot in enumerate(timeline):
+        if not isinstance(slot, dict):
+            continue
+        item = dict(slot)
+        cid = str(
+            item.get("linkedCaptionClipId")
+            or item.get("linked_subtitle_clip_id")
+            or item.get("linkedSubtitleClipId")
+            or ""
+        )
+        cap = clip_by_id.get(cid)
+        if cap is None and index < len(clips):
+            cap = clips[index] if isinstance(clips[index], dict) else None
+
+        if cap:
+            text = str(cap.get("text") or cap.get("displayText") or "").strip()
+            if text:
+                item["subtitle_text"] = text
+            cap_start = float(cap.get("start", item.get("start") or 0))
+            cap_end = float(cap.get("end") or cap_start + _slot_duration(item))
+            template_seg = _best_template_segment_for_range(template_segments, cap_start, cap_end)
+            style = resolve_subtitle_style_for_export(
+                item,
+                caption_clip=cap,
+                template_segment=template_seg,
+            )
+            item["subtitle_style"] = style
+            item["subtitle_segments"] = [
+                {
+                    "start": cap_start,
+                    "end": cap_end,
+                    "text": text or str(item.get("subtitle_text") or ""),
+                    "style": style,
+                }
+            ]
+        result.append(item)
+    return result
+
+
+def _merge_timeline_subtitles(timeline: list, template) -> list[dict[str, Any]]:
+    """保留用户在项目里改过的字幕，仅用模板数据补全缺失槽位。"""
+    enriched = _enrich_timeline_subtitles(timeline, template)
+    merged: list[dict[str, Any]] = []
+    for index, slot in enumerate(timeline):
+        if not isinstance(slot, dict):
+            if index < len(enriched):
+                merged.append(dict(enriched[index]))
+            continue
+        base = dict(enriched[index] if index < len(enriched) else slot)
+        user_text = str(slot.get("subtitle_text") or "").strip()
+        user_segs = slot.get("subtitle_segments")
+        if user_text:
+            base["subtitle_text"] = user_text
+        if isinstance(user_segs, list) and len(user_segs) > 0:
+            base["subtitle_segments"] = [dict(s) for s in user_segs if isinstance(s, dict)]
+        merged.append(base)
+    return _enrich_slots_from_subtitle_clips(merged, template)
+
+
+def _clip_relative_captions(
+    slot: dict[str, Any],
+    clip_duration_sec: float,
+    source_range_start: float,
+) -> list[dict[str, Any]]:
+    """收集本段相对时间（0 秒起）的字幕，供 ASS 烧录。"""
+    raw = _collect_captions_for_slot(
+        slot,
+        timeline_start_us=0,
+        clip_duration_sec=clip_duration_sec,
+        source_range_start=source_range_start,
+    )
+    rel_segments: list[dict[str, Any]] = []
+    for cap in raw:
+        start_sec = max(0.0, float(cap["start"]) / US_PER_SEC)
+        end_sec = min(clip_duration_sec, max(start_sec + 0.08, float(cap["end"]) / US_PER_SEC))
+        rel_segments.append(
+            {
+                "start": start_sec,
+                "end": end_sec,
+                "text": cap["text"],
+                "style": cap.get("style") or {},
+            }
+        )
+    return rel_segments
+
+
+def _burn_slot_video_effects_only(
+    clip_path: str,
+    slot: dict[str, Any],
+    work_dir: str,
+    *,
+    width: int,
+    height: int,
+) -> bool:
+    """剪映导出：仅烧录画面特效，不烧录字幕、不遮罩底部旧字幕区。"""
+    export_slot = merge_auto_effects_into_slot(slot)
+    if not slot_has_post_effects(export_slot):
+        return False
+    effects_vf = compile_slot_post_effects_vf(export_slot, width, height)
+    if not effects_vf:
+        return False
+
+    burned_path = clip_path + ".burn.mp4"
+    try:
+        burn_clip_with_vf_and_subtitles(
+            clip_path,
+            burned_path,
+            ass_path=None,
+            extra_vf=effects_vf,
+            mask_legacy_subtitles=False,
+            height=height,
+        )
+        os.replace(burned_path, clip_path)
+        return True
+    finally:
+        if os.path.isfile(burned_path):
+            try:
+                os.remove(burned_path)
+            except OSError:
+                pass
+
+
+def _burn_subtitles_and_effects_into_clip(
+    clip_path: str,
+    slot: dict[str, Any],
+    work_dir: str,
+    *,
+    width: int,
+    height: int,
+    clip_duration: float,
+    clip_start: float,
+    add_subtitles: bool,
+    mask_legacy_subtitles: bool,
+) -> bool:
+    """将字幕样式与槽位特效烧录进片段；成功则无需再向剪映添加文本轨。"""
+    has_effects = slot_has_post_effects(slot)
+    export_slot = merge_auto_effects_into_slot(slot)
+    has_effects = has_effects or slot_has_post_effects(export_slot)
+    rel_caps: list[dict[str, Any]] = []
+    if add_subtitles:
+        rel_caps = _clip_relative_captions(export_slot, clip_duration, clip_start)
+
+    if not rel_caps and not has_effects and not mask_legacy_subtitles:
+        return False
+
+    ass_path: Optional[str] = None
+    if rel_caps:
+        ass_path = os.path.join(work_dir, f"burn_{uuid.uuid4().hex[:8]}.ass")
+        write_ass_styled_for_clip(rel_caps, ass_path, width=width, height=height)
+
+    effects_vf = compile_slot_post_effects_vf(export_slot, width, height)
+    burned_path = clip_path + ".burn.mp4"
+    try:
+        burn_clip_with_vf_and_subtitles(
+            clip_path,
+            burned_path,
+            ass_path=ass_path,
+            extra_vf=effects_vf,
+            mask_legacy_subtitles=mask_legacy_subtitles and bool(rel_caps),
+            height=height,
+        )
+        os.replace(burned_path, clip_path)
+    finally:
+        if ass_path and os.path.isfile(ass_path):
+            try:
+                os.remove(ass_path)
+            except OSError:
+                pass
+        if os.path.isfile(burned_path):
+            try:
+                os.remove(burned_path)
+            except OSError:
+                pass
+
+    return bool(rel_caps) or has_effects or mask_legacy_subtitles
 
 
 def _clear_draft_cover(draft_id: str) -> None:
@@ -623,6 +920,17 @@ def export_timeline_to_capcut_draft(
             template_video_path = ""
 
     replaceable_mode = capcut_export_mode == "replaceable_template"
+    # 剪映草稿：字幕只写入独立文本轨，永不烧录进画面、永不加底部黑条遮罩
+    capcut_text_track_only = os.getenv("CAPCUT_BURN_SUBTITLES", "0").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+    )
+    export_capcut_transitions = os.getenv("CAPCUT_EXPORT_TRANSITIONS", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     if replaceable_mode and not template_video_path:
         raise RuntimeError("可替换模板模式需要模板原视频，请确认模板已上传并处理完成")
 
@@ -631,10 +939,14 @@ def export_timeline_to_capcut_draft(
         if native:
             width, height = native
 
-    export_timeline = (
-        _enrich_timeline_subtitles(timeline, template) if replaceable_mode else timeline
-    )
+    export_timeline = timeline
+    if replaceable_mode or mix.get("add_subtitles"):
+        export_timeline = _merge_timeline_subtitles(timeline, template)
     template_voice_source = ""
+    tts_segments = _load_template_tts_segments(template)
+    use_tts_audio = bool(
+        tts_segments and any(str(s.get("status") or "") == "generated" for s in tts_segments)
+    )
     if replaceable_mode:
         voice_raw = get_whisper_source_path(template) or template_video_path
         try:
@@ -652,9 +964,19 @@ def export_timeline_to_capcut_draft(
     work_dir = os.path.join("storage", "temp", "capcut_drafts", job_id)
     os.makedirs(work_dir, exist_ok=True)
 
+    if mix.get("add_subtitles") and template_video_path and os.path.isfile(template_video_path):
+        progress(6, "分析模板原片字幕样式")
+        export_timeline = ensure_timeline_styles_from_template_video(
+            export_timeline,
+            template_video_path,
+            os.path.join(work_dir, "template_subtitle_styles"),
+            frame_height=height,
+        )
+
     video_infos: list[dict[str, Any]] = []
     scene_timelines: list[dict[str, int]] = []
     captions: list[dict[str, Any]] = []
+    template_video_slot_count = 0
     slot_audio_infos: list[dict[str, Any]] = []
     slot_manifest_entries: list[dict[str, Any]] = []
     skipped: list[str] = []
@@ -724,13 +1046,17 @@ def export_timeline_to_capcut_draft(
             reuse_segment=item["reuse_segment"],
             template_cut=item.get("template_cut", False),
         )
-        if replaceable_mode and template_voice_source:
-            extract_segment_audio(
-                template_voice_source,
-                item["clip_start"],
-                item["clip_duration"],
-                item["audio_abs"],
-            )
+        if replaceable_mode:
+            tts_seg = _resolve_slot_tts_segment(item["slot"], tts_segments)
+            if use_tts_audio and tts_seg and str(tts_seg.get("status") or "") == "generated":
+                _prepare_tts_audio_for_slot(tts_seg, item["audio_abs"])
+            elif template_voice_source:
+                extract_segment_audio(
+                    template_voice_source,
+                    item["clip_start"],
+                    item["clip_duration"],
+                    item["audio_abs"],
+                )
         return item
 
     cut_failures: list[str] = []
@@ -767,6 +1093,38 @@ def export_timeline_to_capcut_draft(
 
         clip_duration = item["clip_duration"]
         clip_start = item["clip_start"]
+        try:
+            if capcut_text_track_only:
+                _burn_slot_video_effects_only(
+                    out_abs,
+                    slot,
+                    work_dir,
+                    width=width,
+                    height=height,
+                )
+            else:
+                burned = _burn_subtitles_and_effects_into_clip(
+                    out_abs,
+                    slot,
+                    work_dir,
+                    width=width,
+                    height=height,
+                    clip_duration=clip_duration,
+                    clip_start=clip_start,
+                    add_subtitles=bool(mix.get("add_subtitles")),
+                    mask_legacy_subtitles=replaceable_mode and bool(mix.get("add_subtitles")),
+                )
+                if burned and bool(mix.get("add_subtitles")):
+                    pass  # legacy burn path; default disabled for capcut drafts
+        except Exception as exc:
+            warnings.append(f"槽位 {slot.get('slot_id', index + 1)} 烧录失败：{exc}")
+
+        has_asset = bool(
+            slot.get("asset_id") or slot.get("asset_file_path") or slot.get("segment_file_path")
+        )
+        if not has_asset and not replaceable_mode and template_video_path:
+            template_video_slot_count += 1
+
         cursor_sec = item["cursor_sec"]
         slot_abs_start = item["slot_abs_start"]
         keep_audio = item["keep_audio"]
@@ -803,7 +1161,7 @@ def export_timeline_to_capcut_draft(
             if keep_audio
             else 0.0,
         }
-        if not replaceable_mode and index < len(export_timeline) - 1:
+        if not replaceable_mode and export_capcut_transitions and index < len(export_timeline) - 1:
             trans_name, trans_dur = _capcut_transition(slot)
             if trans_name:
                 video_item["transition"] = trans_name
@@ -819,6 +1177,10 @@ def export_timeline_to_capcut_draft(
             )
         else:
             scene_timelines.append({"start": start_us, "end": end_us})
+
+        template_range_start, _ = _slot_template_range(slot)
+        caption_source_start = template_range_start if not replaceable_mode else clip_start
+        caption_slot = merge_auto_effects_into_slot(slot)
 
         if replaceable_mode:
             label = _slot_label(slot, index)
@@ -838,10 +1200,10 @@ def export_timeline_to_capcut_draft(
             )
             captions.extend(
                 _collect_captions_for_slot(
-                    slot,
+                    caption_slot,
                     timeline_start_us=start_us,
                     clip_duration_sec=clip_duration,
-                    source_range_start=clip_start,
+                    source_range_start=caption_source_start,
                 )
             )
             audio_abs = item.get("audio_abs") or ""
@@ -859,14 +1221,20 @@ def export_timeline_to_capcut_draft(
                     }
                 )
         elif mix.get("add_subtitles"):
-            captions.extend(
-                _collect_captions_for_slot(
+            caps = _collect_captions_for_slot(
+                caption_slot,
+                timeline_start_us=start_us,
+                clip_duration_sec=clip_duration,
+                source_range_start=caption_source_start,
+            )
+            if not caps and str(slot.get("subtitle_text") or "").strip():
+                caps = _collect_captions_for_slot(
                     slot,
                     timeline_start_us=start_us,
                     clip_duration_sec=clip_duration,
-                    source_range_start=clip_start,
+                    source_range_start=0.0,
                 )
-            )
+            captions.extend(caps)
 
     if not video_infos:
         detail = "没有可导出的视频片段"
@@ -906,7 +1274,7 @@ def export_timeline_to_capcut_draft(
     draft_url = video_resp.get("draft_url") or draft_url
 
     if replaceable_mode and slot_audio_infos:
-        progress(84, "添加原视频人声")
+        progress(84, "添加 AI 人声音频" if use_tts_audio else "添加原视频人声")
         try:
             audio_resp = add_audios(draft_url, slot_audio_infos)
             draft_url = audio_resp.get("draft_url") or draft_url
@@ -942,9 +1310,17 @@ def export_timeline_to_capcut_draft(
     if not replaceable_mode:
         draft_url = _add_sfx_to_draft(draft_url, template, media_base, warnings)
 
-    if captions:
-        progress(86, "添加字幕")
-        draft_url = _add_styled_captions_to_draft(draft_url, captions, warnings)
+    if captions and mix.get("add_subtitles"):
+        progress(86, "添加字幕文本轨")
+        draft_url = _add_styled_captions_to_draft(
+            draft_url, captions, warnings, frame_height=height
+        )
+
+    if template_video_slot_count > 0:
+        warnings.append(
+            f"有 {template_video_slot_count} 段使用模板原视频（画面内可能含旧烧录字幕）；"
+            "匹配无字幕素材后导出，或于剪映中替换素材，可避免画面内叠字"
+        )
 
     progress(95, "保存剪映草稿")
     save_resp = save_draft(draft_url, clip_count=len(video_infos))
@@ -956,7 +1332,7 @@ def export_timeline_to_capcut_draft(
 
     replace_guide = (
         "在剪映中：选中时间轴上的占位片段 → 右键「替换素材」或点击工具栏替换按钮，"
-        "选择你的成片视频即可逐段替换。字幕与人声已按槽位对齐。"
+        "选择你的成片视频即可逐段替换。字幕轨与动画特效在独立文本轨，人声按槽位对齐。"
     )
     slot_manifest: dict[str, Any] | None = None
     slot_manifest_url = ""
@@ -977,9 +1353,10 @@ def export_timeline_to_capcut_draft(
     open_hint = (
         "导出成功后，请点击 draft_url 链接（需已安装剪映 PC 版与剪映小助手）。"
         "不要手动新建空白草稿；链接会在剪映中打开已排好片段的项目。"
+        "字幕在独立文本轨（未烧录进画面），可在剪映中编辑样式与动画。"
     )
     if replaceable_mode:
-        open_hint += " 打开后逐段「替换素材」即可套用你的成片，字幕与人声已按槽位分割对齐。"
+        open_hint += " 打开后逐段「替换素材」即可套用你的成片。"
 
     progress(100, "剪映草稿生成完成")
     draft_url = normalize_draft_url(draft_url)
@@ -988,6 +1365,8 @@ def export_timeline_to_capcut_draft(
         "draft_id": draft_id,
         "clips_count": len(video_infos),
         "captions_count": len(captions),
+        "captions_burned": False,
+        "subtitle_mode": "text_track_only",
         "duration_sec": round(cursor_sec, 3),
         "skipped_slots": skipped,
         "warnings": warnings,

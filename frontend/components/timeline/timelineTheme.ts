@@ -24,6 +24,7 @@ export const TIMELINE_THEME = {
     subtitle: { bg: '#6b3410', fg: '#fdba74' },
     audio: { bg: '#1a3050', fg: '#60a5fa' },
     audioVoice: { bg: '#1a3a55', fg: '#7dd3fc' },
+    ttsVoice: { bg: '#3d1f55', fg: '#e879f9' },
   },
   video: {
     header: '#163d34',

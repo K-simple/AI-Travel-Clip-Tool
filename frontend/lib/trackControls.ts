@@ -7,6 +7,7 @@ export type TrackKey =
   | 'transition'
   | 'adjust'
   | 'subtitle'
+  | 'ttsVoice'
   | 'audio'
   | 'audioVoice';
 
@@ -26,6 +27,7 @@ export const TRACK_KEYS: TrackKey[] = [
   'transition',
   'adjust',
   'subtitle',
+  'ttsVoice',
   'audio',
   'audioVoice',
 ];
@@ -38,7 +40,8 @@ export const TRACK_LABELS: Record<TrackKey, string> = {
   filter: '滤镜',
   transition: '转场',
   adjust: '调节',
-  subtitle: '文本',
+  subtitle: '字幕',
+  ttsVoice: 'AI人声',
   audio: '音乐',
   audioVoice: '原声',
 };

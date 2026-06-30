@@ -165,6 +165,7 @@ def _run_export_job(
             use_asset_audio=use_asset_audio,
             asset_audio_volume=asset_audio_volume,
             template_audio_volume=template_audio_volume,
+            tts_segments=getattr(template, "tts_segments_json", []) or [],
         )
     return {"output_url": f"/storage/exports/{os.path.basename(output_path)}", "filename": os.path.basename(output_path), "codec": video_codec}
 

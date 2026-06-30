@@ -2,13 +2,15 @@
 
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from models.database import SessionLocal, Template
 from services.beat_detector import estimate_beat_markers
 from services.processing_config import (
+    DEFER_TEMPLATE_AI_LABELS,
     DEFER_TEMPLATE_PROXIES,
     DEFER_WHISPER,
+    ENABLE_AI_LABELS,
     TEMPLATE_EXTRACT_AUDIO_EARLY,
     TEMPLATE_FAST_EDIT_READY,
     TEMPLATE_FAST_SKIP_AUTO_TUNE,
@@ -16,13 +18,16 @@ from services.processing_config import (
 )
 from services.scene_detector import (
     _attach_thumbnails,
-    build_template_shot_slots,
+    build_template_intake_slots,
     extract_frame,
     get_video_duration,
 )
 from services.proxy_generator import generate_preview_proxies, normalize_proxy_paths
 from services.slot_analyzer import enrich_template_slots
 from services.template_vision_analyzer import analyze_template_overview
+from services.template_effects_analyzer import enrich_slots_with_ai_effects
+from services.template_intake import intake_already_rich, process_template_intake
+from services.template_subtitle_auto import queue_auto_subtitle_batch
 
 
 def mark_template_failed(template_id: str, error: str = "") -> None:
@@ -92,48 +97,37 @@ def _bump_enhance(template_id: str, progress: int) -> None:
     _update_template(template_id, enhance_progress=progress, enhance_status="processing")
 
 
-def process_template_edit_ready(template_id: str, file_path: str) -> list:
-    """
-    第一阶段：约 10 秒内可编辑。
-    - 时长 + 封面
-    - PySceneDetect 按画面切槽（跳过 AI 修正、跳过代理、跳过缩略图批量抽取）
-    """
+def process_template_edit_ready(
+    template_id: str,
+    file_path: str,
+    *,
+    extract_audio_fn=None,
+    has_audio_fn=None,
+    file_ok_fn=None,
+) -> list:
+    """模板 intake：切分 + AI 理解 + 字幕/花字（约 30s）。"""
+    template_dir = os.path.dirname(file_path)
     _update_template(
         template_id,
-        processing_progress=15,
+        processing_progress=5,
         processing_status="processing",
         enhance_status="processing",
         enhance_progress=0,
     )
-
-    duration = get_video_duration(file_path)
-    if duration <= 0:
-        raise RuntimeError("无法读取模板视频时长")
-
-    thumb_dir = os.path.join("storage", "thumbnails", template_id)
-    os.makedirs(thumb_dir, exist_ok=True)
-    main_thumb = os.path.join(thumb_dir, "main.jpg").replace("\\", "/")
-    extract_frame(file_path, max(duration / 2, 0.5), main_thumb)
-
-    _update_template(template_id, processing_progress=35, processing_status="processing")
-
-    fast = TEMPLATE_FAST_EDIT_READY
-    slots = build_template_shot_slots(
+    slots = process_template_intake(
+        template_id,
         file_path,
-        thumb_dir,
-        duration,
-        skip_auto_tune=fast and TEMPLATE_FAST_SKIP_AUTO_TUNE,
-        skip_ai_refine=True,
-        extract_thumbs=False,
-        allow_interval_fallback=TEMPLATE_SCENE_INTERVAL_FALLBACK,
+        template_dir,
         on_progress=lambda p: _update_template(
             template_id, processing_progress=min(95, p), processing_status="processing"
         ),
+        extract_audio_fn=extract_audio_fn,
+        has_audio_fn=has_audio_fn,
+        file_ok_fn=file_ok_fn,
     )
-
-    if not slots:
-        raise RuntimeError("镜头切分未产生槽位，请检查视频格式或场景检测配置")
-
+    duration = get_video_duration(file_path)
+    if duration <= 0 and slots:
+        duration = sum(float(s.get("duration", 0) or 0) for s in slots)
     mark_template_editable(
         template_id,
         slots=slots,
@@ -141,7 +135,46 @@ def process_template_edit_ready(template_id: str, file_path: str) -> list:
         beat_markers=[],
         proxy_paths={},
     )
+    _kick_early_preview_proxy(template_id, file_path, template_dir)
+    from services.processing_config import is_base_slot_creation_mode
+
+    if not is_base_slot_creation_mode():
+        queue_auto_subtitle_batch(template_id)
+    else:
+        print(f"模板 [{template_id}] base 模式：跳过 intake 后自动字幕，请用户点击「识别字幕」")
     return slots
+
+
+def _kick_early_preview_proxy(template_id: str, file_path: str, template_dir: str) -> None:
+    """可编辑后立即后台生成 smooth/low 代理，避免预览长期解码原片卡顿。"""
+    import threading
+
+    def _worker() -> None:
+        proxy_paths: Dict[str, str] = {"clear": "", "smooth": "", "low": ""}
+        try:
+            def _on_tier(tier: str, path: str) -> None:
+                proxy_paths[tier] = path
+                _update_template(
+                    template_id,
+                    proxy_paths=normalize_proxy_paths(dict(proxy_paths)),
+                )
+
+            generate_preview_proxies(
+                file_path,
+                template_dir,
+                "template",
+                on_tier_ready=_on_tier,
+                tiers=("smooth", "low"),
+            )
+            print(f"模板预览代理就绪: {template_id} smooth={bool(proxy_paths.get('smooth'))}")
+        except Exception as exc:
+            print(f"模板预览代理失败 [{template_id}]: {exc}")
+
+    threading.Thread(
+        target=_worker,
+        daemon=True,
+        name=f"template-proxy-{template_id[:8]}",
+    ).start()
 
 
 def _apply_media_enrichment(
@@ -232,42 +265,98 @@ def process_template_enhancement(
     os.makedirs(thumb_dir, exist_ok=True)
 
     try:
-        # 1) AI 镜头修正（合并误切 / 拆分漏切）
         _bump_enhance(template_id, 10)
-        from services.ai_shot_refiner import refine_shots_with_ai
-        from services.template_scene_tuning import resolve_tuning_for_template
 
-        tuning = resolve_tuning_for_template(file_path)
-        refined = refine_shots_with_ai(slots, file_path, thumb_dir, tuning=tuning)
-        if refined:
-            slots = refined
-            print(f"AI 镜头修正完成: {template_id} -> {len(slots)} 段")
+        rich = intake_already_rich(slots)
 
+        proxy_paths: Dict[str, str] = {"clear": "", "smooth": "", "low": ""}
+        inner = SessionLocal()
+        try:
+            tpl = inner.query(Template).filter(Template.id == template_id).first()
+            if tpl:
+                proxy_paths = normalize_proxy_paths(getattr(tpl, "proxy_paths", None))
+        finally:
+            inner.close()
+
+        if not proxy_paths.get("smooth"):
+            def _on_tier_early(tier: str, path: str) -> None:
+                proxy_paths[tier] = path
+                _update_template(
+                    template_id,
+                    proxy_paths=normalize_proxy_paths(dict(proxy_paths)),
+                )
+
+            generate_preview_proxies(
+                file_path,
+                template_dir,
+                "template",
+                on_tier_ready=_on_tier_early,
+                tiers=("smooth", "low"),
+            )
+        _bump_enhance(template_id, 18)
+
+        # 1) AI 镜头修正（base / 单槽模式不再拆镜）
+        from services.processing_config import is_base_slot_creation_mode
+
+        if not rich and not is_base_slot_creation_mode() and len(slots) > 1:
+            from services.ai_shot_refiner import refine_shots_with_ai
+            from services.template_scene_tuning import resolve_tuning_for_template
+
+            tuning = resolve_tuning_for_template(file_path)
+            refined = refine_shots_with_ai(slots, file_path, thumb_dir, tuning=tuning)
+            if refined:
+                slots = refined
+                print(f"AI 镜头修正完成: {template_id} -> {len(slots)} 段")
+
+        _bump_enhance(template_id, 25)
+
+        # 2) 缩略图（intake 通常已完成）
+        if any(not str(s.get("thumbnail") or "").strip() for s in slots):
+            slots = _attach_thumbnails(file_path, thumb_dir, slots)
+            _update_template(template_id, slots=slots, slot_count=len(slots))
         _bump_enhance(template_id, 35)
 
-        # 2) 槽位缩略图
-        slots = _attach_thumbnails(file_path, thumb_dir, slots)
-        _update_template(template_id, slots=slots, slot_count=len(slots))
-        _bump_enhance(template_id, 45)
+        # 3) 深度 AI（budget 默认跳过 DeepSeek，intake CLIP 标签已够用）
+        skip_deep_ai = rich or DEFER_TEMPLATE_AI_LABELS or not ENABLE_AI_LABELS
+        if skip_deep_ai:
+            print(f"模板 AI 标签跳过 [{template_id}]: intake 已有 CLIP/标签或已延后")
+            _bump_enhance(template_id, 45)
+        elif not rich:
+            try:
+                process_template_slot_enrich(
+                    template_id,
+                    file_path,
+                    slots=slots,
+                    thumb_dir=thumb_dir,
+                    on_progress=lambda p: _bump_enhance(template_id, p),
+                )
+            except Exception as exc:
+                print(f"模板 AI 画面理解跳过: {exc}")
+        else:
+            try:
+                slots = enrich_slots_with_ai_effects(file_path, slots, thumb_dir)
+                _update_template(template_id, slots=slots, slot_count=len(slots))
+                print(f"模板后台特效 AI 补充: {template_id}")
+            except Exception as exc:
+                print(f"模板特效 AI 跳过: {exc}")
+        _bump_enhance(template_id, 55)
 
-        # 3) AI 理解模板画面（槽位描述 + 成片摘要，优先于代理生成）
-        try:
-            process_template_slot_enrich(template_id, file_path, slots=slots, thumb_dir=thumb_dir)
-        except Exception as exc:
-            print(f"模板 AI 画面理解跳过: {exc}")
-        _bump_enhance(template_id, 65)
-
-        # 4) 预览代理（后台生成，不阻塞编辑）
-        proxy_paths: Dict[str, str] = {"clear": "", "smooth": "", "low": ""}
-
+        # 4) 预览代理 clear 档（smooth/low 通常已在 intake 后生成）
         def _on_tier(tier: str, path: str) -> None:
             proxy_paths[tier] = path
             _update_template(
                 template_id,
-                proxy_paths=normalize_proxy_paths(proxy_paths),
+                proxy_paths=normalize_proxy_paths(dict(proxy_paths)),
             )
 
-        generate_preview_proxies(file_path, template_dir, "template", on_tier_ready=_on_tier)
+        if not proxy_paths.get("clear"):
+            generate_preview_proxies(
+                file_path,
+                template_dir,
+                "template",
+                on_tier_ready=_on_tier,
+                tiers=("clear",),
+            )
 
         _bump_enhance(template_id, 82)
 
@@ -332,7 +421,7 @@ def process_template_fast_intake(template_id: str, file_path: str) -> None:
         generate_preview_proxies(file_path, template_dir, "template", on_tier_ready=_on_tier)
 
     _update_template(template_id, processing_progress=38, processing_status="processing")
-    slots = build_template_shot_slots(
+    slots = build_template_intake_slots(
         file_path,
         thumb_dir,
         duration,
@@ -360,6 +449,7 @@ def process_template_slot_enrich(
     *,
     slots: list | None = None,
     thumb_dir: str = "",
+    on_progress: Callable[[int], None] | None = None,
 ) -> None:
     """为模板槽位补充 AI 画面描述与成片级视觉摘要。"""
     db = SessionLocal()
@@ -379,6 +469,8 @@ def process_template_slot_enrich(
         thumb_dir = os.path.join("storage", "thumbnails", template_id)
 
     pending_save = [0]
+    labeled_count = [0]
+    total_slots = len(working_slots)
 
     def _flush_slots(force: bool = False) -> None:
         if not pending_save[0] and not force:
@@ -399,6 +491,10 @@ def process_template_slot_enrich(
     def _on_slot_ready(index: int, item: dict) -> None:
         working_slots[index] = item
         pending_save[0] += 1
+        if item.get("ai_description"):
+            labeled_count[0] += 1
+            if on_progress and total_slots > 0:
+                on_progress(35 + int(20 * labeled_count[0] / total_slots))
         if pending_save[0] >= 2:
             _flush_slots()
 
@@ -412,6 +508,7 @@ def process_template_slot_enrich(
         _flush_slots(force=True)
 
         vision = analyze_template_overview(file_path, thumb_dir, duration, working_slots)
+        working_slots[:] = enrich_slots_with_ai_effects(file_path, working_slots, thumb_dir)
         inner = SessionLocal()
         try:
             tpl = inner.query(Template).filter(Template.id == template_id).first()
@@ -474,7 +571,13 @@ def process_template_full(
     file_ok_fn,
 ) -> None:
     if TEMPLATE_FAST_EDIT_READY:
-        process_template_edit_ready(template_id, file_path)
+        process_template_edit_ready(
+            template_id,
+            file_path,
+            extract_audio_fn=extract_audio_fn,
+            has_audio_fn=has_audio_fn,
+            file_ok_fn=file_ok_fn,
+        )
         process_template_enhancement(
             template_id,
             file_path,

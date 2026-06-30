@@ -42,6 +42,19 @@ def _effective_tags(item: dict) -> list:
     for t in item.get("ai_tags") or []:
         if t and t not in tags:
             tags.append(t)
+    subject = str(item.get("ai_subject") or "").strip()
+    if subject and subject not in tags:
+        tags.append(subject)
+    hint = str(item.get("ai_replace_hint") or "").strip()
+    if hint:
+        try:
+            from services.smart_matcher import _cn_tokens
+
+            for token in list(_cn_tokens(hint))[:6]:
+                if token not in tags:
+                    tags.append(token)
+        except Exception:
+            pass
     return tags
 
 
@@ -74,12 +87,12 @@ def calculate_visual_score(slot: dict, seg: dict, prefer_quality: bool = True) -
     shot_score = (
         1.0
         if slot.get("shot_type") and slot.get("shot_type") == seg.get("shot_type")
-        else 0.3
+        else 0.35
     )
     quality = float(seg.get("quality_score", 0.5))
     if prefer_quality:
         quality = min(1.0, quality * 1.15)
-    return shot_score * 0.6 + quality * 0.4
+    return shot_score * 0.55 + quality * 0.45
 
 
 def _slot_id(slot: dict, index: int):
@@ -99,9 +112,16 @@ def match_slots(
     dedup_global = opts.get("dedup_policy", "global") != "none"
 
     dur_weight = cfg.duration_weight()
-    total_weight = cfg.tags_weight + cfg.visual_weight + dur_weight
+    semantic_weight = float(opts.get("semantic_weight", 0.4))
+    min_match_score = float(opts.get("min_match_score", 0.38))
+    total_weight = cfg.tags_weight + cfg.visual_weight + dur_weight + semantic_weight
     if total_weight <= 0:
         total_weight = 1.0
+
+    try:
+        from services.smart_matcher import calculate_semantic_score
+    except Exception:
+        calculate_semantic_score = None  # type: ignore
 
     results = []
     used = set()
@@ -142,11 +162,15 @@ def match_slots(
                 _effective_tags(seg),
             )
             visual_score = calculate_visual_score(slot, seg, prefer_quality=prefer_quality)
+            semantic_score = (
+                calculate_semantic_score(slot, seg) if calculate_semantic_score else 0.0
+            )
 
             total = (
                 tag_score * cfg.tags_weight
                 + visual_score * cfg.visual_weight
                 + dur_score * dur_weight
+                + semantic_score * semantic_weight
             ) / total_weight
 
             if opts.get("use_vector_match", True):
@@ -164,15 +188,17 @@ def match_slots(
                 best_detail = {
                     "tag": tag_score,
                     "visual": visual_score,
+                    "semantic": semantic_score,
                     "dur": dur_score,
                     "total": total,
                     "seg_tags": (_effective_tags(seg))[:4],
-                    "slot_desc": slot.get("ai_description", ""),
+                    "slot_desc": slot.get("ai_description") or slot.get("subtitle_visual_context", ""),
                     "seg_desc": seg.get("ai_description", ""),
+                    "replace_hint": slot.get("ai_replace_hint", ""),
                     "shot_type": seg.get("shot_type", ""),
                 }
 
-        if best:
+        if best and best_score >= min_match_score:
             seg_key = f"{best.get('asset_id')}_{best.get('segment_id')}"
             if dedup_global:
                 used.add(seg_key)
@@ -204,12 +230,15 @@ def match_slots(
                 "segment_file_path": seg_video,
             })
         else:
+            reason = "没有找到合适的素材"
+            if best and best_score >= 0 and best_score < min_match_score:
+                reason = f"相似度 {best_score:.0%} 低于阈值 {min_match_score:.0%}，请手动挑选"
             results.append({
                 "slot_id": current_slot_id,
                 "slot_duration": slot_duration,
-                "match_score": 0,
+                "match_score": round(best_score, 3) if best_score >= 0 else 0,
                 "asset_id": None,
-                "error": "没有找到合适的素材",
+                "error": reason,
             })
 
     return results
@@ -220,6 +249,7 @@ def _format_match_reason(detail: Optional[dict]) -> str:
         return "自动匹配"
     parts = [
         f"标签 {detail['tag']:.0%}",
+        f"语义 {detail.get('semantic', 0):.0%}",
         f"景别 {detail['visual']:.0%}",
         f"时长 {detail['dur']:.0%}",
     ]
@@ -230,8 +260,13 @@ def _format_match_reason(detail: Optional[dict]) -> str:
     seg_desc = detail.get("seg_desc") or ""
     if slot_desc and seg_desc:
         parts.append(f"画面 {slot_desc}→{seg_desc}")
+    elif slot_desc:
+        parts.append(f"模板 {slot_desc}")
     elif seg_desc:
-        parts.append(f"画面 {seg_desc}")
+        parts.append(f"素材 {seg_desc}")
+    hint = detail.get("replace_hint") or ""
+    if hint:
+        parts.append(f"建议 {hint[:16]}")
     shot = detail.get("shot_type")
     if shot:
         parts.append(f"镜头 {shot}")

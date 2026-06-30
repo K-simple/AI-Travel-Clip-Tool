@@ -169,38 +169,3 @@ def enrich_edl_asset_paths(edl: Dict[str, Any], timeline: List[Dict[str, Any]]) 
                 if seg and str(seg) in path_by_asset:
                     clip["asset_file_path"] = path_by_asset[str(seg)]
     return edl
-
-
-def edl_to_slot_timeline(edl: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """从 EDL 视频轨还原槽位 timeline（简化）。"""
-    tracks = edl.get("tracks") or {}
-    video_tracks = tracks.get("video") or []
-    if not video_tracks:
-        return []
-
-    clips = video_tracks[0].get("clips") or []
-    subtitle_tracks = tracks.get("subtitle") or []
-    sub_clips = subtitle_tracks[0].get("clips") if subtitle_tracks else []
-
-    timeline: List[Dict[str, Any]] = []
-    for i, clip in enumerate(clips):
-        dst_in = float(clip.get("dst_in", 0))
-        dst_out = float(clip.get("dst_out", dst_in))
-        dur = dst_out - dst_in
-        texts = [
-            s.get("text", "")
-            for s in (sub_clips or [])
-            if float(s.get("dst_in", -1)) >= dst_in and float(s.get("dst_out", 0)) <= dst_out + 0.01
-        ]
-        timeline.append({
-            "slot_id": clip.get("slot_id", i + 1),
-            "slot_duration": dur,
-            "slot_start": dst_in,
-            "slot_end": dst_out,
-            "asset_id": clip.get("asset_seg_id"),
-            "clip_start": clip.get("src_in", 0),
-            "clip_duration": dur,
-            "subtitle_text": " ".join(texts).strip(),
-            "transition_out": clip.get("transition_out"),
-        })
-    return timeline

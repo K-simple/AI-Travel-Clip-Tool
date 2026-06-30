@@ -65,6 +65,9 @@ def normalize_slot(slot: Dict[str, Any], index: int, timeline_cursor: float = 0.
         "slot_end": timeline_end,
         "slot_duration": duration,
         "template_thumbnail": slot.get("thumbnail", slot.get("thumb", slot.get("template_thumbnail", ""))),
+        "filmstrip": slot.get("filmstrip", ""),
+        "filmstrip_frames": slot.get("filmstrip_frames"),
+        "filmstrip_tile_width": slot.get("filmstrip_tile_width"),
         "shot_type": slot.get("shot_type", ""),
         "scene_tags": slot.get("tags", slot.get("scene_tags", [])),
         "ai_description": slot.get("ai_description", ""),
@@ -73,11 +76,21 @@ def normalize_slot(slot: Dict[str, Any], index: int, timeline_cursor: float = 0.
         "ai_subject": slot.get("ai_subject", ""),
         "subtitle_text": slot.get("subtitle_text", ""),
         "subtitle_segments": slot.get("subtitle_segments", []),
+        "subtitle_source": slot.get("subtitle_source", ""),
+        "subtitle_quality": slot.get("subtitle_quality", ""),
+        "subtitle_status_reason": slot.get("subtitle_status_reason", ""),
+        "subtitle_duplicate": bool(slot.get("subtitle_duplicate", False)),
+        "subtitle_visual_context": slot.get("subtitle_visual_context", ""),
+        "subtitle_scene_match": slot.get("subtitle_scene_match"),
+        "subtitle_scene_match_reason": slot.get("subtitle_scene_match_reason", ""),
         "asset_id": slot.get("asset_id"),
         "asset_file_path": slot.get("asset_file_path", ""),
         "asset_thumbnail": slot.get("asset_thumbnail", ""),
         "asset_filename": slot.get("asset_filename", ""),
         "clip_start": float(clip_start),
+        "template_source_start": float(
+            slot.get("template_source_start", slot.get("start", source_start))
+        ),
         "clip_duration": slot.get("clip_duration", duration),
         "use_original_audio": slot.get("use_original_audio", False),
         "asset_audio_volume": slot.get("asset_audio_volume", 0.3),
@@ -108,6 +121,56 @@ def merge_template_timeline(existing: list, template: Template) -> list:
     if not fresh:
         return existing or []
 
+    from services.slot_helpers import has_ai_caption_split_slots
+
+    preserve_keys = (
+        "asset_id",
+        "segment_id",
+        "segment_file_path",
+        "asset_file_path",
+        "asset_filename",
+        "asset_thumbnail",
+        "clip_start",
+        "clip_duration",
+        "clip_end",
+        "match_score",
+        "match_reason",
+        "locked",
+    )
+
+    def _preserve(old: dict) -> dict:
+        return {k: old[k] for k in preserve_keys if old.get(k) is not None}
+
+    if has_ai_caption_split_slots(fresh):
+        old_by_caption: dict[str, dict] = {}
+        old_by_slot: dict[str, dict] = {}
+        for slot in existing or []:
+            if not isinstance(slot, dict):
+                continue
+            sid = str(slot.get("slot_id", ""))
+            if sid:
+                old_by_slot[sid] = slot
+            cid = str(
+                slot.get("linkedCaptionClipId")
+                or slot.get("linked_subtitle_clip_id")
+                or slot.get("linkedSubtitleClipId")
+                or ""
+            )
+            if cid:
+                old_by_caption[cid] = slot
+
+        merged = []
+        for slot in fresh:
+            cid = str(
+                slot.get("linkedCaptionClipId")
+                or slot.get("linked_subtitle_clip_id")
+                or slot.get("linkedSubtitleClipId")
+                or ""
+            )
+            old = old_by_caption.get(cid) or old_by_slot.get(str(slot.get("slot_id", "")))
+            merged.append({**slot, **_preserve(old)} if old else slot)
+        return merged
+
     old_by_slot = {}
     for slot in existing or []:
         if isinstance(slot, dict):
@@ -122,21 +185,7 @@ def merge_template_timeline(existing: list, template: Template) -> list:
         if not old:
             merged.append(slot)
             continue
-        preserved = {
-            "asset_id": old.get("asset_id"),
-            "segment_id": old.get("segment_id"),
-            "segment_file_path": old.get("segment_file_path"),
-            "asset_file_path": old.get("asset_file_path"),
-            "asset_filename": old.get("asset_filename"),
-            "asset_thumbnail": old.get("asset_thumbnail"),
-            "clip_start": old.get("clip_start"),
-            "clip_duration": old.get("clip_duration"),
-            "clip_end": old.get("clip_end"),
-            "match_score": old.get("match_score"),
-            "match_reason": old.get("match_reason"),
-            "locked": old.get("locked", False),
-        }
-        merged.append({**slot, **{k: v for k, v in preserved.items() if v is not None}})
+        merged.append({**slot, **_preserve(old)})
     return merged
 
 
@@ -192,8 +241,9 @@ def _save_timeline(
     }
 
 
-@router.post("/create")
+@router.post("/create", deprecated=True)
 def create_project(req: CreateProjectRequest, db: Session = Depends(get_db)):
+    """已弃用：请使用 POST /from-template 从模板初始化 timeline。"""
     template = db.query(Template).filter(Template.id == req.template_id).first()
     if not template:
         raise HTTPException(status_code=404, detail="模板不存在")

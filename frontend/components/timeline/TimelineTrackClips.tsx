@@ -5,6 +5,7 @@ import { toMediaUrl } from '@/lib/api';
 import { canAcceptTimelineDrop } from '@/lib/timelineDrop';
 import { pseudoWaveform } from '@/lib/timelineLayout';
 import { ClipFilmstrip } from '@/components/timeline/ClipFilmstrip';
+import type { TimelineThumbnail } from '@/lib/timelineThumbnails';
 import { TIMELINE_THEME } from './timelineTheme';
 
 function cn(...parts: Array<string | false | null | undefined>) {
@@ -125,6 +126,15 @@ type VideoClipProps = {
   thumb: string;
   videoSrc?: string;
   clipStart?: number;
+  filmstripUrl?: string;
+  filmstripFrames?: number;
+  filmstripTileWidth?: number;
+  timelineThumbnails?: TimelineThumbnail[];
+  timelineThumbnailsLoading?: boolean;
+  sampleIntervalSec?: number;
+  slotSourceStart?: number;
+  slotSourceEnd?: number;
+  sourceDuration?: number;
   title: string;
   tags: string;
   duration: number;
@@ -141,12 +151,22 @@ type VideoClipProps = {
   slotId?: string;
   onSlotReorderDragStart?: (e: DragEvent<HTMLDivElement>, slotId: string) => void;
   onSlotReorderDrop?: (e: DragEvent<HTMLDivElement>, targetSlotId: string) => void;
+  subtitleAttention?: 'none' | 'warn' | 'bad';
 };
 
 export function CapCutVideoClip({
   thumb,
   videoSrc = '',
   clipStart = 0,
+  filmstripUrl,
+  filmstripFrames,
+  filmstripTileWidth,
+  timelineThumbnails,
+  timelineThumbnailsLoading,
+  sampleIntervalSec,
+  slotSourceStart,
+  slotSourceEnd,
+  sourceDuration,
   title,
   tags,
   duration,
@@ -163,12 +183,24 @@ export function CapCutVideoClip({
   slotId,
   onSlotReorderDragStart,
   onSlotReorderDrop,
+  subtitleAttention = 'none',
 }: VideoClipProps) {
   const label = tags || title;
   const safeDuration = Math.max(duration, 0.5);
+  const attentionRing =
+    subtitleAttention === 'bad'
+      ? 'shadow-[inset_0_0_0_2px_#ef4444]'
+      : subtitleAttention === 'warn'
+        ? 'shadow-[inset_0_0_0_2px_#f59e0b]'
+        : '';
 
   const renderBody = () => {
-    if (videoSrc) {
+    if (
+      videoSrc ||
+      filmstripUrl ||
+      timelineThumbnails?.length ||
+      timelineThumbnailsLoading
+    ) {
       return (
         <ClipFilmstrip
           videoSrc={videoSrc}
@@ -177,6 +209,14 @@ export function CapCutVideoClip({
           width={width}
           pxPerSec={pxPerSec}
           fallbackThumb={thumb}
+          filmstripUrl={filmstripUrl}
+          filmstripFrames={filmstripFrames}
+          filmstripTileWidth={filmstripTileWidth}
+          timelineThumbnails={timelineThumbnails}
+          timelineThumbnailsLoading={timelineThumbnailsLoading}
+          sampleIntervalSec={sampleIntervalSec}
+          slotSourceStart={slotSourceStart}
+          slotSourceEnd={slotSourceEnd}
         />
       );
     }
@@ -228,7 +268,7 @@ export function CapCutVideoClip({
         dimmed && !locked && 'opacity-50',
         selected
           ? 'shadow-[inset_0_0_0_2px_#face15]'
-          : 'shadow-[inset_0_0_0_1px_rgba(255,255,255,0.08)]'
+          : attentionRing || 'shadow-[inset_0_0_0_1px_rgba(255,255,255,0.08)]'
       )}
       style={{ backgroundColor: TIMELINE_THEME.video.body }}
     >
@@ -284,6 +324,7 @@ export function CapCutSubtitleClip({
   locked,
   dimmed,
   onClick,
+  subtitleAttention = 'none',
 }: {
   text: string;
   accentColor?: string;
@@ -291,8 +332,15 @@ export function CapCutSubtitleClip({
   locked: boolean;
   dimmed?: boolean;
   onClick: () => void;
+  subtitleAttention?: 'none' | 'warn' | 'bad';
 }) {
   const accent = accentColor && /^#[0-9a-fA-F]{6}$/.test(accentColor) ? accentColor : '#ffffff';
+  const attentionRing =
+    subtitleAttention === 'bad'
+      ? 'shadow-[inset_0_0_0_2px_#ef4444]'
+      : subtitleAttention === 'warn'
+        ? 'shadow-[inset_0_0_0_2px_#f59e0b]'
+        : '';
   return (
     <div
       onClick={onClick}
@@ -302,7 +350,7 @@ export function CapCutSubtitleClip({
         dimmed && !locked && 'opacity-40',
         selected
           ? 'shadow-[inset_0_0_0_2px_#face15]'
-          : 'shadow-[inset_0_0_0_1px_rgba(194,65,12,0.5)]'
+          : attentionRing || 'shadow-[inset_0_0_0_1px_rgba(194,65,12,0.5)]'
       )}
       style={{
         background: selected

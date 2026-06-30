@@ -128,6 +128,42 @@ export default function TemplateLibraryPanel({
     }
   };
 
+  const reprocessTemplate = async (templateId: string) => {
+    setBusyId(templateId);
+    setMessage('');
+    try {
+      const resp = await fetch(apiUrl(`/api/template/${templateId}/reprocess`), {
+        method: 'POST',
+        headers: apiHeaders(),
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error((data.detail as string) || '重新切分失败');
+      setMessage('正在重新对齐字幕（保留镜头槽），约 2–3 分钟，完成后请点刷新');
+      const poll = async (attempt = 0): Promise<void> => {
+        if (attempt > 120) return;
+        await new Promise((r) => setTimeout(r, 3000));
+        const statusResp = await fetch(apiUrl(`/api/template/${templateId}/status`), {
+          headers: apiHeaders(),
+        });
+        const status = await statusResp.json();
+        if (!statusResp.ok) return poll(attempt + 1);
+        const processing = status.processing_status === 'processing';
+        const count = Number(status.slot_count ?? 0);
+        if (!processing && count > 0) {
+          await refresh();
+          setMessage(`重新切分完成：${count} 槽位（请点「载入」同步到编辑器）`);
+          return;
+        }
+        return poll(attempt + 1);
+      };
+      void poll();
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : '重新切分失败');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
   const importCtplFile = async (file: File) => {
     setMessage('');
     try {
@@ -443,20 +479,29 @@ export default function TemplateLibraryPanel({
                       {t.processing_status || 'ready'}
                     </div>
                     {!selectMode ? (
-                      <div className="mt-2 flex gap-2">
+                      <div className="mt-2 flex flex-wrap gap-2">
                         <button
                           type="button"
                           disabled={cardBusy}
                           onClick={() => onSelectTemplate?.(t.template_id)}
-                          className="flex-1 rounded bg-[#face15] py-1 text-[10px] font-medium text-black hover:bg-[#ffe066] disabled:opacity-50"
+                          className="min-w-[3.5rem] flex-1 rounded bg-[#face15] py-1 text-[10px] font-medium text-black hover:bg-[#ffe066] disabled:opacity-50"
                         >
                           载入
                         </button>
                         <button
                           type="button"
+                          disabled={cardBusy || t.processing_status === 'processing'}
+                          onClick={() => void reprocessTemplate(t.template_id)}
+                          className="min-w-[3.5rem] flex-1 rounded bg-[#2a2a2a] py-1 text-[10px] text-[#ccc] hover:bg-[#333] disabled:opacity-50"
+                          title="按烧录字幕重新识别并对齐槽位（默认保留镜头数）"
+                        >
+                          重切分
+                        </button>
+                        <button
+                          type="button"
                           disabled={cardBusy}
                           onClick={() => void exportCtpl(t.template_id)}
-                          className="flex-1 rounded bg-[#2a2a2a] py-1 text-[10px] text-[#ccc] hover:bg-[#333] disabled:opacity-50"
+                          className="min-w-[3.5rem] flex-1 rounded bg-[#2a2a2a] py-1 text-[10px] text-[#ccc] hover:bg-[#333] disabled:opacity-50"
                         >
                           导出
                         </button>

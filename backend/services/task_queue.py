@@ -6,9 +6,18 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, Optional
 
-_executor = ThreadPoolExecutor(max_workers=4)
+from services.processing_config import TASK_QUEUE_WORKERS
+
+_executor: ThreadPoolExecutor | None = None
 _tasks: Dict[str, Dict[str, Any]] = {}
 _lock = threading.Lock()
+
+
+def _pool() -> ThreadPoolExecutor:
+    global _executor
+    if _executor is None:
+        _executor = ThreadPoolExecutor(max_workers=TASK_QUEUE_WORKERS)
+    return _executor
 
 
 def create_task(task_type: str, payload: Optional[Dict[str, Any]] = None) -> str:
@@ -65,4 +74,4 @@ def run_task(task_id: str, fn: Callable[[], Any]) -> None:
                 error=str(exc),
             )
 
-    _executor.submit(_worker)
+    _pool().submit(_worker)

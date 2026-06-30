@@ -16,7 +16,10 @@ git+https://github.com/openai/CLIP.git
 librosa==0.10.2.post1
 soundfile==0.12.1
 easyocr==1.7.1
+# 烧录字幕 OCR：backend 设 OCR_ENGINE=paddle 启用（中文识别通常优于 EasyOCR）
+paddleocr>=2.7.0
+paddlepaddle>=2.6.0
 demucs==4.0.1
 boto3==1.34.131
 pymilvus==2.4.4
-psycopg2-binary==2.9.9
+pytest==8.2.2
